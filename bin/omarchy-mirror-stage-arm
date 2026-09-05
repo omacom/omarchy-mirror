@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Pull Arch Linux ARM repositories over HTTP(S), without rsync or R2."""
+
+import argparse
+import base64
+import binascii
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+import hashlib
+from http.client import HTTPException
+import io
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
+
+
+DEFAULT_UPSTREAM = "https://fl.us.mirror.archlinuxarm.org"
+REPOSITORIES = ("core", "extra", "alarm", "aur")
+PACKAGE_NAME = re.compile(r"[A-Za-z0-9_+.~:@-]+\.pkg\.tar\.[A-Za-z0-9]+")
+GIB = 1024**3
+
+
+class SyncError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Package:
+    name: str
+    size: int
+    sha256: str
+    signature: bytes
+
+
+def manifest(data, label):
+    """Read desc records only; never extract upstream archive paths to disk."""
+    packages = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r|*") as archive:
+            for member in archive:
+                if not member.name.endswith("/desc"):
+                    continue
+                if not member.isfile() or member.size > 1024 * 1024:
+                    raise ValueError(f"invalid desc member: {member.name}")
+                fields = {}
+                key = None
+                for line in archive.extractfile(member).read().decode("utf-8").splitlines():
+                    if re.fullmatch(r"%[A-Z0-9_]+%", line):
+                        key = line
+                        if key in fields:
+                            raise ValueError(f"duplicate {key} in {member.name}")
+                        fields[key] = []
+                    elif line and key:
+                        fields[key].append(line)
+                values = []
+                for key in ("%FILENAME%", "%CSIZE%", "%SHA256SUM%", "%PGPSIG%"):
+                    if len(fields.get(key, [])) != 1:
+                        raise ValueError(f"{member.name}: missing or invalid {key}")
+                    values.append(fields[key][0])
+                name, size, digest, signature = values
+                if not PACKAGE_NAME.fullmatch(name):
+                    raise ValueError(f"unsafe package filename: {name!r}")
+                if int(size) <= 0 or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+                    raise ValueError(f"invalid size or SHA-256: {name}")
+                signature = base64.b64decode(signature, validate=True)
+                if not signature or name in packages:
+                    raise ValueError(f"empty signature or duplicate package: {name}")
+                packages[name] = Package(name, int(size), digest.lower(), signature)
+    except (tarfile.TarError, OSError, EOFError, ValueError, binascii.Error) as error:
+        raise SyncError(f"Invalid repository database {label}: {error}") from error
+    if not packages:
+        raise SyncError(f"Empty repository database {label}; refusing to publish or prune")
+    return packages
+
+
+def remote_url(upstream, relative):
+    return upstream.rstrip("/") + "/" + quote(relative, safe="/")
+
+
+def request(url, timeout):
+    return urlopen(Request(url, headers={
+        "User-Agent": "omarchy-mirror-stage-arm/1",
+        "Cache-Control": "no-cache",
+    }), timeout=timeout)
+
+
+def retry(operation, attempts):
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except HTTPError as error:
+            if error.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            last_error = error
+        except (URLError, TimeoutError, ConnectionError, HTTPException, SyncError) as error:
+            last_error = error
+        if attempt + 1 < attempts:
+            time.sleep(min(2**attempt, 8))
+    raise last_error
+
+
+def fetch(args, relative, optional=False):
+    def read():
+        with request(remote_url(args.upstream, relative), args.timeout) as response:
+            return response.read()
+    try:
+        return retry(read, args.retries)
+    except HTTPError as error:
+        if optional and error.code == 404:
+            return None
+        raise SyncError(f"Cannot fetch {relative}: HTTP {error.code}") from error
+
+
+def valid_package(path, package):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size != package.size:
+        return False
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest() == package.sha256
+
+
+def atomic_write(path, data):
+    if path.is_file() and not path.is_symlink() and path.read_bytes() == data:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".arm-", suffix=".part", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(data)
+            os.fchmod(destination.fileno(), 0o644)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def download(args, relative, package):
+    target = args.stage / relative / package.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    def transfer():
+        descriptor, name = tempfile.mkstemp(prefix=".arm-", suffix=".part", dir=target.parent)
+        temporary = Path(name)
+        try:
+            digest = hashlib.sha256()
+            size = 0
+            with os.fdopen(descriptor, "wb") as destination:
+                with request(remote_url(args.upstream, f"{relative}/{package.name}"), args.timeout) as source:
+                    while chunk := source.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > package.size:
+                            raise SyncError(f"Oversized download: {relative}/{package.name}")
+                        digest.update(chunk)
+                        destination.write(chunk)
+                os.fchmod(destination.fileno(), 0o644)
+            if size != package.size or digest.hexdigest() != package.sha256:
+                raise SyncError(f"Checksum/size mismatch: {relative}/{package.name}")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    try:
+        retry(transfer, args.retries)
+    except HTTPError as error:
+        raise SyncError(f"Cannot download {relative}/{package.name}: HTTP {error.code}; rerun to refresh databases") from error
+
+
+@contextmanager
+def stage_lock(stage):
+    # Keep internal state outside the tree that could later be uploaded.
+    stage.parent.mkdir(parents=True, exist_ok=True)
+    with stage.with_name(stage.name + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SyncError(f"Another ARM sync is using {stage}") from error
+        yield
+
+
+def sync(args):
+    snapshots = {}
+    pending = []
+    total = 0
+    for arch in args.arch:
+        for repo in args.repos:
+            relative = f"{arch}/{repo}"
+            # Reject symlinked repository directories before any writes or pruning.
+            if (args.stage / arch).is_symlink() or (args.stage / relative).is_symlink():
+                raise SyncError(f"Symlinked staging directory: {relative}")
+            print(f"Reading {relative}/{repo}.db", flush=True)
+            database = fetch(args, f"{relative}/{repo}.db")
+            packages = manifest(database, relative)
+            missing = [package for package in packages.values()
+                       if not valid_package(args.stage / relative / package.name, package)]
+            size = sum(package.size for package in packages.values())
+            needed = sum(package.size for package in missing)
+            print(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
+                  f"download {len(missing):,} packages / {needed / GIB:.2f} GiB", flush=True)
+            snapshots[relative] = (repo, database, packages)
+            pending.extend((relative, package) for package in missing)
+            total += len(packages)
+
+    required = sum(package.size for _, package in pending)
+    existing = args.stage
+    while not existing.exists():
+        existing = existing.parent
+    free = shutil.disk_usage(existing).free
+    print(f"Total: {total:,} packages; {len(pending):,} downloads / {required / GIB:.2f} GiB; "
+          f"free {free / GIB:.2f} GiB", flush=True)
+    if args.dry_run:
+        if required + GIB > free:
+            print("Insufficient space for this sync (includes 1 GiB headroom).", flush=True)
+        return
+    if required + GIB > free:
+        raise SyncError("Insufficient disk space (requires downloads plus 1 GiB headroom)")
+
+    # Validate the file-list DB against the package DB before transferring packages.
+    metadata = {}
+    for relative, (repo, database, packages) in snapshots.items():
+        files = fetch(args, f"{relative}/{repo}.files")
+        file_packages = manifest(files, f"{relative}/{repo}.files")
+        if any(packages.get(name) != package for name, package in file_packages.items()):
+            raise SyncError(f"{relative}: .db and .files disagree; upstream may be syncing, rerun later")
+        if len(file_packages) < len(packages):
+            print(f"{relative}: upstream .files omits {len(packages) - len(file_packages)} "
+                  "packages; preserving upstream metadata and downloading all .db packages", flush=True)
+        for kind, data in (("db", database), ("files", files)):
+            if not data.startswith(b"\x1f\x8b"):
+                raise SyncError(f"{relative}/{repo}.{kind}: expected upstream gzip database")
+            metadata[f"{relative}/{repo}.{kind}"] = data
+            metadata[f"{relative}/{repo}.{kind}.tar.gz"] = data
+            signature = fetch(args, f"{relative}/{repo}.{kind}.sig", optional=True)
+            metadata[f"{relative}/{repo}.{kind}.sig"] = signature
+            metadata[f"{relative}/{repo}.{kind}.tar.gz.sig"] = signature
+
+    print(f"Downloading with {args.workers} workers", flush=True)
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        jobs = [pool.submit(download, args, relative, package) for relative, package in pending]
+        try:
+            for count, job in enumerate(as_completed(jobs), 1):
+                job.result()
+                if count % 100 == 0 or count == len(jobs):
+                    print(f"Downloaded and verified {count:,}/{len(jobs):,} packages", flush=True)
+        except BaseException:
+            for job in jobs:
+                job.cancel()
+            raise
+
+    # Detect a rolling upstream before exposing any new repository metadata.
+    for relative, (repo, database, _) in snapshots.items():
+        if fetch(args, f"{relative}/{repo}.db") != database:
+            raise SyncError(f"{relative}: upstream database changed; rerun to finish (downloads retained)")
+        for kind in ("db", "files"):
+            if fetch(args, f"{relative}/{repo}.{kind}.sig", optional=True) != metadata[f"{relative}/{repo}.{kind}.sig"]:
+                raise SyncError(f"{relative}: upstream metadata signature changed; rerun to finish")
+
+    # PGPSIG is the original detached signature, base64-encoded in the database.
+    for relative, (_, _, packages) in snapshots.items():
+        for package in packages.values():
+            atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
+    for relative, data in metadata.items():
+        path = args.stage / relative
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write(path, data)
+
+    if args.prune:
+        removed = 0
+        for relative, (_, _, packages) in snapshots.items():
+            expected = set(packages) | {name + ".sig" for name in packages}
+            for path in (args.stage / relative).iterdir():
+                name = path.name.removesuffix(".sig")
+                if PACKAGE_NAME.fullmatch(name) and path.name not in expected and (path.is_file() or path.is_symlink()):
+                    path.unlink()
+                    removed += 1
+        print(f"Pruned {removed:,} obsolete package/signature files", flush=True)
+    atomic_write(args.stage / "lastsync", f"{int(time.time())}\n".encode())
+    print(f"Complete: {total:,} packages verified; {len(pending):,} downloaded. Stage: {args.stage}", flush=True)
+
+
+def positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage", required=True, type=Path, help="dedicated local ARM mirror directory")
+    parser.add_argument("--upstream", default=DEFAULT_UPSTREAM, help="HTTP(S) mirror root")
+    parser.add_argument("--arch", action="append", choices=("aarch64", "armv7h"), help="repeat for both; default: aarch64")
+    parser.add_argument("--repos", nargs="+", choices=REPOSITORIES, default=list(REPOSITORIES))
+    parser.add_argument("--workers", type=positive, default=4)
+    parser.add_argument("--retries", type=positive, default=3, help="attempts per failed request")
+    parser.add_argument("--timeout", type=positive, default=60, help="network timeout in seconds")
+    parser.add_argument("--dry-run", action="store_true", help="read package DBs, hash local files, and report downloads; no writes")
+    parser.add_argument("--prune", action="store_true", help="remove obsolete packages in selected repos after successful sync")
+    args = parser.parse_args()
+    upstream = urlsplit(args.upstream)
+    if upstream.scheme not in ("https", "http") or not upstream.netloc or upstream.query or upstream.fragment:
+        parser.error("--upstream must be an HTTP(S) mirror root without a query or fragment")
+    args.stage = args.stage.expanduser().resolve()
+    if args.stage == args.stage.parent:
+        parser.error("--stage must be a dedicated mirror directory, not /")
+    args.arch = list(dict.fromkeys(args.arch or ["aarch64"]))
+    args.repos = list(dict.fromkeys(args.repos))
+    try:
+        if args.dry_run:
+            sync(args)
+        else:
+            with stage_lock(args.stage):
+                sync(args)
+    except (SyncError, OSError, URLError, HTTPException) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Interrupted; rerun to reuse completed downloads.", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
