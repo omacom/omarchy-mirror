@@ -42,9 +42,46 @@ class Package:
     signature: bytes
 
 
-def manifest(data, label):
+@dataclass(frozen=True)
+class Manifest:
+    packages: dict
+    records: dict
+    recovered: tuple
+
+
+def package_from_desc(data):
+    fields = {}
+    key = None
+    for line in data.decode("utf-8").splitlines():
+        if re.fullmatch(r"%[A-Z0-9_]+%", line):
+            key = line
+            if key in fields:
+                raise ValueError(f"duplicate {key}")
+            fields[key] = []
+        elif line and key:
+            fields[key].append(line)
+    values = []
+    for key in ("%FILENAME%", "%CSIZE%", "%SHA256SUM%", "%PGPSIG%"):
+        if len(fields.get(key, [])) != 1:
+            raise ValueError(f"missing or invalid {key}")
+        values.append(fields[key][0])
+    name, size, digest, signature = values
+    if not PACKAGE_NAME.fullmatch(name):
+        raise ValueError(f"unsafe package filename: {name!r}")
+    if int(size) <= 0 or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+        raise ValueError(f"invalid size or SHA-256: {name}")
+    signature = base64.b64decode(signature, validate=True)
+    if not signature:
+        raise ValueError(f"empty signature: {name}")
+    return Package(name, int(size), digest.lower(), signature)
+
+
+def manifest(data, label, recovery=None):
     """Read desc records only; never extract upstream archive paths to disk."""
     packages = {}
+    records = {}
+    recovered = []
+    recovery = recovery or {}
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r|*") as archive:
             for member in archive:
@@ -52,35 +89,30 @@ def manifest(data, label):
                     continue
                 if not member.isfile() or member.size > 1024 * 1024:
                     raise ValueError(f"invalid desc member: {member.name}")
-                fields = {}
-                key = None
-                for line in archive.extractfile(member).read().decode("utf-8").splitlines():
-                    if re.fullmatch(r"%[A-Z0-9_]+%", line):
-                        key = line
-                        if key in fields:
-                            raise ValueError(f"duplicate {key} in {member.name}")
-                        fields[key] = []
-                    elif line and key:
-                        fields[key].append(line)
-                values = []
-                for key in ("%FILENAME%", "%CSIZE%", "%SHA256SUM%", "%PGPSIG%"):
-                    if len(fields.get(key, [])) != 1:
-                        raise ValueError(f"{member.name}: missing or invalid {key}")
-                    values.append(fields[key][0])
-                name, size, digest, signature = values
-                if not PACKAGE_NAME.fullmatch(name):
-                    raise ValueError(f"unsafe package filename: {name!r}")
-                if int(size) <= 0 or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
-                    raise ValueError(f"invalid size or SHA-256: {name}")
-                signature = base64.b64decode(signature, validate=True)
-                if not signature or name in packages:
-                    raise ValueError(f"empty signature or duplicate package: {name}")
-                packages[name] = Package(name, int(size), digest.lower(), signature)
+                if member.name in records:
+                    raise ValueError(f"duplicate desc member: {member.name}")
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ValueError(f"cannot read desc member: {member.name}")
+                body = source.read()
+                try:
+                    package = package_from_desc(body)
+                except (ValueError, binascii.Error) as error:
+                    package = recovery.get(member.name)
+                    # Only the known upstream corruption pattern is recoverable.
+                    # Other malformed content could be conflicting or malicious.
+                    if package is None or not body or any(body):
+                        raise ValueError(f"{member.name}: {error}") from error
+                    recovered.append((member.name, str(error)))
+                if package.name in packages:
+                    raise ValueError(f"duplicate package: {package.name}")
+                packages[package.name] = package
+                records[member.name] = package
     except (tarfile.TarError, OSError, EOFError, ValueError, binascii.Error) as error:
         raise SyncError(f"Invalid repository database {label}: {error}") from error
     if not packages:
         raise SyncError(f"Empty repository database {label}; refusing to publish or prune")
-    return packages
+    return Manifest(packages, records, tuple(recovered))
 
 
 def remote_url(upstream, relative):
@@ -201,14 +233,31 @@ def sync(args):
                 raise SyncError(f"Symlinked staging directory: {relative}")
             print(f"Reading {relative}/{repo}.db", flush=True)
             database = fetch(args, f"{relative}/{repo}.db")
-            packages = manifest(database, relative)
+            files = fetch(args, f"{relative}/{repo}.files")
+            file_manifest = manifest(files, f"{relative}/{repo}.files")
+            package_manifest = manifest(database, relative, recovery=file_manifest.records)
+            packages = package_manifest.packages
+            if package_manifest.recovered:
+                for member, reason in package_manifest.recovered:
+                    print(f"{relative}: WARNING: recovered malformed {repo}.db record {member} "
+                          f"from the exact matching {repo}.files record ({reason})", flush=True)
+            if any(packages[name] != package
+                   for name, package in file_manifest.packages.items() if name in packages):
+                raise SyncError(f"{relative}: .db and .files disagree; upstream may be syncing, rerun later")
+            for name in sorted(set(file_manifest.packages) - set(packages)):
+                print(f"{relative}: WARNING: {repo}.files references {name}, which is absent "
+                      f"from the {repo}.db package manifest; not staging it", flush=True)
+            if len(file_manifest.packages) < len(packages):
+                print(f"{relative}: upstream .files omits "
+                      f"{len(packages) - len(file_manifest.packages)} packages; preserving upstream "
+                      "metadata and downloading all .db packages", flush=True)
             missing = [package for package in packages.values()
                        if not valid_package(args.stage / relative / package.name, package)]
             size = sum(package.size for package in packages.values())
             needed = sum(package.size for package in missing)
             print(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
                   f"download {len(missing):,} packages / {needed / GIB:.2f} GiB", flush=True)
-            snapshots[relative] = (repo, database, packages)
+            snapshots[relative] = (repo, database, files, packages)
             pending.extend((relative, package) for package in missing)
             total += len(packages)
 
@@ -226,16 +275,8 @@ def sync(args):
     if required + GIB > free:
         raise SyncError("Insufficient disk space (requires downloads plus 1 GiB headroom)")
 
-    # Validate the file-list DB against the package DB before transferring packages.
     metadata = {}
-    for relative, (repo, database, packages) in snapshots.items():
-        files = fetch(args, f"{relative}/{repo}.files")
-        file_packages = manifest(files, f"{relative}/{repo}.files")
-        if any(packages.get(name) != package for name, package in file_packages.items()):
-            raise SyncError(f"{relative}: .db and .files disagree; upstream may be syncing, rerun later")
-        if len(file_packages) < len(packages):
-            print(f"{relative}: upstream .files omits {len(packages) - len(file_packages)} "
-                  "packages; preserving upstream metadata and downloading all .db packages", flush=True)
+    for relative, (repo, database, files, _) in snapshots.items():
         for kind, data in (("db", database), ("files", files)):
             if not data.startswith(b"\x1f\x8b"):
                 raise SyncError(f"{relative}/{repo}.{kind}: expected upstream gzip database")
@@ -259,15 +300,17 @@ def sync(args):
             raise
 
     # Detect a rolling upstream before exposing any new repository metadata.
-    for relative, (repo, database, _) in snapshots.items():
-        if fetch(args, f"{relative}/{repo}.db") != database:
-            raise SyncError(f"{relative}: upstream database changed; rerun to finish (downloads retained)")
+    for relative, (repo, _, _, _) in snapshots.items():
         for kind in ("db", "files"):
+            if fetch(args, f"{relative}/{repo}.{kind}") != metadata[f"{relative}/{repo}.{kind}"]:
+                database_label = "database" if kind == "db" else "files database"
+                raise SyncError(f"{relative}: upstream {database_label} changed; "
+                                "rerun to finish (downloads retained)")
             if fetch(args, f"{relative}/{repo}.{kind}.sig", optional=True) != metadata[f"{relative}/{repo}.{kind}.sig"]:
                 raise SyncError(f"{relative}: upstream metadata signature changed; rerun to finish")
 
     # PGPSIG is the original detached signature, base64-encoded in the database.
-    for relative, (_, _, packages) in snapshots.items():
+    for relative, (_, _, _, packages) in snapshots.items():
         for package in packages.values():
             atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
     for relative, data in metadata.items():
@@ -279,7 +322,7 @@ def sync(args):
 
     if args.prune:
         removed = 0
-        for relative, (_, _, packages) in snapshots.items():
+        for relative, (_, _, _, packages) in snapshots.items():
             expected = set(packages) | {name + ".sig" for name in packages}
             for path in (args.stage / relative).iterdir():
                 name = path.name.removesuffix(".sig")

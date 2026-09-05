@@ -20,14 +20,15 @@ API = runpy.run_path(str(SCRIPT))
 PREFIX = "/aarch64/core/"
 
 
-def database(records):
+def database(records, record_names=None):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for index, (name, body, signature) in enumerate(records):
             desc = (f"%FILENAME%\n{name}\n\n%CSIZE%\n{len(body)}\n\n"
                     f"%SHA256SUM%\n{hashlib.sha256(body).hexdigest()}\n\n"
                     f"%PGPSIG%\n{base64.b64encode(signature).decode()}\n\n").encode()
-            member = tarfile.TarInfo(f"package-{index}/desc")
+            record_name = record_names[index] if record_names else f"package-{index}"
+            member = tarfile.TarInfo(f"{record_name}/desc")
             member.size = len(desc)
             archive.addfile(member, io.BytesIO(desc))
     return buffer.getvalue()
@@ -157,11 +158,22 @@ class MirrorTest(unittest.TestCase):
         self.assertEqual(self.requests[PREFIX + self.first[0]], 0)
 
     def test_db_files_mismatch_fails_before_packages(self):
-        self.files[PREFIX + "core.files"] = database([("other-1-1-any.pkg.tar.xz", b"other", b"sig")])
+        self.files[PREFIX + "core.files"] = database([(self.first[0], b"other", b"sig")])
         result = self.run_sync(success=False)
         self.assertIn(".db and .files disagree", result.stderr)
         self.assertEqual(self.requests[PREFIX + self.first[0]], 0)
         self.assertFalse((self.stage / "lastsync").exists())
+
+    def test_files_only_package_is_reported_and_not_staged(self):
+        orphan = ("orphan-1-1-any.pkg.tar.xz", b"orphan", b"signature")
+        self.files[PREFIX + "core.files"] = database([self.first, orphan])
+
+        result = self.run_sync()
+
+        self.assertIn(f"WARNING: core.files references {orphan[0]}", result.stdout)
+        self.assertIn("not staging it", result.stdout)
+        self.assertEqual(self.requests[PREFIX + orphan[0]], 0)
+        self.assertFalse((self.stage / "aarch64/core" / orphan[0]).exists())
 
     def test_older_packages_missing_from_files_db_are_still_downloaded(self):
         second = ("legacy-1-1-any.pkg.tar.xz", b"legacy package", b"legacy signature")
@@ -194,6 +206,44 @@ class MirrorTest(unittest.TestCase):
                 self.run_sync("--prune", success=False)
                 self.assertFalse((self.stage / "lastsync").exists())
                 self.assertEqual(self.requests[PREFIX + self.first[0]], 0)
+
+    def test_malformed_db_record_recovers_from_exact_files_record(self):
+        record_name = "findnewest-0.3-4"
+        null_record = io.BytesIO()
+        with tarfile.open(fileobj=null_record, mode="w:gz") as archive:
+            member = tarfile.TarInfo(f"{record_name}/desc")
+            member.size = 1271
+            archive.addfile(member, io.BytesIO(b"\0" * member.size))
+        self.files[PREFIX + "core.db"] = null_record.getvalue()
+        self.files[PREFIX + "core.files"] = database([self.first], [record_name])
+
+        result = self.run_sync()
+
+        self.assertIn("WARNING: recovered malformed core.db record", result.stdout)
+        self.assertEqual((self.stage / "aarch64/core" / self.first[0]).read_bytes(), self.first[1])
+        self.assertEqual((self.stage / "aarch64/core/core.db").read_bytes(), null_record.getvalue())
+
+    def test_recovered_files_database_change_fails_before_publish(self):
+        record_name = "findnewest-0.3-4"
+        null_record = io.BytesIO()
+        with tarfile.open(fileobj=null_record, mode="w:gz") as archive:
+            member = tarfile.TarInfo(f"{record_name}/desc")
+            member.size = 1271
+            archive.addfile(member, io.BytesIO(b"\0" * member.size))
+        self.files[PREFIX + "core.db"] = null_record.getvalue()
+        self.files[PREFIX + "core.files"] = database([self.first], [record_name])
+
+        def change(path):
+            if path == PREFIX + "core.files" and self.requests[path] == 2:
+                self.files[path] = database([("other-1-1-aarch64.pkg.tar.xz",
+                                              b"other", b"signature")], [record_name])
+
+        self.hook = change
+        result = self.run_sync(success=False)
+
+        self.assertIn("upstream files database changed", result.stderr)
+        self.assertFalse((self.stage / "lastsync").exists())
+        self.assertFalse((self.stage / "aarch64/core/core.db").exists())
 
     def test_database_signatures_are_preserved_and_removed_when_absent_upstream(self):
         for kind in ("db", "files"):
