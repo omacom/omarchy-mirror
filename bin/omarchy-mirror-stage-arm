@@ -4,13 +4,14 @@
 import argparse
 import base64
 import binascii
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
 from http.client import HTTPException
 import io
+import json
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ DEFAULT_UPSTREAM = "https://fl.us.mirror.archlinuxarm.org"
 REPOSITORIES = ("core", "extra", "alarm", "aur")
 PACKAGE_NAME = re.compile(r"[A-Za-z0-9_+.~:@-]+\.pkg\.tar\.[A-Za-z0-9]+")
 GIB = 1024**3
+DEGRADED = 3
 
 
 class SyncError(Exception):
@@ -221,43 +223,103 @@ def stage_lock(stage):
         yield
 
 
+def progress(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def status_document(args, state, **details):
+    return dict(schema_version=1, status=state, stage=str(args.stage),
+                upstream=args.upstream, checked_at=int(time.time()),
+                selected_repositories=[f"{arch}/{repo}" for arch in args.arch for repo in args.repos],
+                **details)
+
+
+def write_status(args, document):
+    atomic_write(args.stage.with_name(args.stage.name + ".status.json"),
+                 (json.dumps(document, indent=2, sort_keys=True) + "\n").encode())
+
+
+def transfer_packages(args, pending):
+    """Bound queued work to twice the worker count, including on large mirrors."""
+    progress(f"Downloading with {args.workers} workers")
+    remaining = iter(pending)
+    jobs = set()
+    count = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        def fill():
+            while len(jobs) < 2 * args.workers:
+                item = next(remaining, None)
+                if item is None:
+                    break
+                jobs.add(pool.submit(download, args, *item))
+
+        try:
+            fill()
+            while jobs:
+                done, jobs = wait(jobs, return_when=FIRST_COMPLETED)
+                for job in done:
+                    job.result()
+                    count += 1
+                    if count % 100 == 0 or count == len(pending):
+                        progress(f"Downloaded and verified {count:,}/{len(pending):,} packages")
+                fill()
+        except BaseException:
+            for job in jobs:
+                job.cancel()
+            raise
+
+
 def sync(args):
     snapshots = {}
+    repositories = {}
     pending = []
     total = 0
+    degraded = False
     for arch in args.arch:
         for repo in args.repos:
             relative = f"{arch}/{repo}"
             # Reject symlinked repository directories before any writes or pruning.
             if (args.stage / arch).is_symlink() or (args.stage / relative).is_symlink():
                 raise SyncError(f"Symlinked staging directory: {relative}")
-            print(f"Reading {relative}/{repo}.db", flush=True)
+            progress(f"Reading {relative}/{repo}.db")
             database = fetch(args, f"{relative}/{repo}.db")
             files = fetch(args, f"{relative}/{repo}.files")
             file_manifest = manifest(files, f"{relative}/{repo}.files")
-            package_manifest = manifest(database, relative, recovery=file_manifest.records)
+            recovery = file_manifest.records if args.recover_null_records else None
+            package_manifest = manifest(database, relative, recovery=recovery)
             packages = package_manifest.packages
             if package_manifest.recovered:
                 for member, reason in package_manifest.recovered:
-                    print(f"{relative}: WARNING: recovered malformed {repo}.db record {member} "
-                          f"from the exact matching {repo}.files record ({reason})", flush=True)
+                    progress(f"{relative}: WARNING: recovered malformed {repo}.db record {member} "
+                             f"from the exact matching {repo}.files record ({reason}); metadata remains degraded")
             if any(packages[name] != package
                    for name, package in file_manifest.packages.items() if name in packages):
                 raise SyncError(f"{relative}: .db and .files disagree; upstream may be syncing, rerun later")
-            for name in sorted(set(file_manifest.packages) - set(packages)):
-                print(f"{relative}: WARNING: {repo}.files references {name}, which is absent "
-                      f"from the {repo}.db package manifest; not staging it", flush=True)
-            if len(file_manifest.packages) < len(packages):
-                print(f"{relative}: upstream .files omits "
-                      f"{len(packages) - len(file_manifest.packages)} packages; preserving upstream "
-                      "metadata and downloading all .db packages", flush=True)
+            files_only = sorted(set(file_manifest.packages) - set(packages))
+            missing_from_files = sorted(set(packages) - set(file_manifest.packages))
+            for name in files_only:
+                if f"{relative}/{name}" not in args.allow_files_only:
+                    raise SyncError(f"{relative}: .files-only package {name}; upstream may be syncing. "
+                                    "Rerun later, or investigate before using "
+                                    f"--allow-files-only {relative}/{name} for degraded package staging")
+                progress(f"{relative}: WARNING: explicitly allowed .files-only package {name}; "
+                         "not staging it; metadata remains degraded")
+            if missing_from_files:
+                progress(f"{relative}: upstream .files omits {len(missing_from_files)} packages; "
+                         "preserving upstream metadata and downloading all .db packages")
+            degraded |= bool(package_manifest.recovered or files_only)
             missing = [package for package in packages.values()
                        if not valid_package(args.stage / relative / package.name, package)]
             size = sum(package.size for package in packages.values())
             needed = sum(package.size for package in missing)
-            print(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
-                  f"download {len(missing):,} packages / {needed / GIB:.2f} GiB", flush=True)
+            progress(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
+                     f"download {len(missing):,} packages / {needed / GIB:.2f} GiB")
             snapshots[relative] = (repo, database, files, packages)
+            repositories[relative] = dict(package_count=len(packages), package_bytes=size,
+                                          downloads=len(missing), recovered_records=list(package_manifest.recovered),
+                                          files_only=files_only, missing_from_files=missing_from_files,
+                                          db_sha256=hashlib.sha256(database).hexdigest(),
+                                          files_sha256=hashlib.sha256(files).hexdigest())
             pending.extend((relative, package) for package in missing)
             total += len(packages)
 
@@ -266,12 +328,14 @@ def sync(args):
     while not existing.exists():
         existing = existing.parent
     free = shutil.disk_usage(existing).free
-    print(f"Total: {total:,} packages; {len(pending):,} downloads / {required / GIB:.2f} GiB; "
-          f"free {free / GIB:.2f} GiB", flush=True)
+    progress(f"Total: {total:,} packages; {len(pending):,} downloads / {required / GIB:.2f} GiB; "
+             f"free {free / GIB:.2f} GiB")
     if args.dry_run:
         if required + GIB > free:
-            print("Insufficient space for this sync (includes 1 GiB headroom).", flush=True)
-        return
+            raise SyncError("Insufficient space for this sync (includes 1 GiB headroom)")
+        return status_document(args, "degraded" if degraded else "dry_run", dry_run=True,
+                               metadata_published=False, repositories=repositories,
+                               package_count=total, downloads=len(pending))
     if required + GIB > free:
         raise SyncError("Insufficient disk space (requires downloads plus 1 GiB headroom)")
 
@@ -286,18 +350,7 @@ def sync(args):
             metadata[f"{relative}/{repo}.{kind}.sig"] = signature
             metadata[f"{relative}/{repo}.{kind}.tar.gz.sig"] = signature
 
-    print(f"Downloading with {args.workers} workers", flush=True)
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        jobs = [pool.submit(download, args, relative, package) for relative, package in pending]
-        try:
-            for count, job in enumerate(as_completed(jobs), 1):
-                job.result()
-                if count % 100 == 0 or count == len(jobs):
-                    print(f"Downloaded and verified {count:,}/{len(jobs):,} packages", flush=True)
-        except BaseException:
-            for job in jobs:
-                job.cancel()
-            raise
+    transfer_packages(args, pending)
 
     # Detect a rolling upstream before exposing any new repository metadata.
     for relative, (repo, _, _, _) in snapshots.items():
@@ -313,6 +366,10 @@ def sync(args):
     for relative, (_, _, _, packages) in snapshots.items():
         for package in packages.values():
             atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
+    if degraded:
+        return status_document(args, "degraded", metadata_published=False,
+                               repositories=repositories, package_count=total,
+                               packages_verified=total, downloads=len(pending))
     for relative, data in metadata.items():
         path = args.stage / relative
         if data is None:
@@ -329,9 +386,13 @@ def sync(args):
                 if PACKAGE_NAME.fullmatch(name) and path.name not in expected and (path.is_file() or path.is_symlink()):
                     path.unlink()
                     removed += 1
-        print(f"Pruned {removed:,} obsolete package/signature files", flush=True)
-    atomic_write(args.stage / "lastsync", f"{int(time.time())}\n".encode())
-    print(f"Complete: {total:,} packages verified; {len(pending):,} downloaded. Stage: {args.stage}", flush=True)
+        progress(f"Pruned {removed:,} obsolete package/signature files")
+    checked_at = int(time.time())
+    for relative in snapshots:
+        atomic_write(args.stage / relative / "lastsync", f"{checked_at}\n".encode())
+    return status_document(args, "complete", metadata_published=True,
+                           repositories=repositories, package_count=total,
+                           packages_verified=total, downloads=len(pending))
 
 
 def positive(value):
@@ -342,7 +403,9 @@ def positive(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     epilog="Exit codes: 0 complete/dry-run, 1 failure, 2 usage, "
+                                            "3 degraded metadata (not published), 130 interrupted.")
     parser.add_argument("--stage", required=True, type=Path, help="dedicated local ARM mirror directory")
     parser.add_argument("--upstream", default=DEFAULT_UPSTREAM, help="HTTP(S) mirror root")
     parser.add_argument("--arch", action="append", choices=("aarch64", "armv7h"), help="repeat for both; default: aarch64")
@@ -352,6 +415,11 @@ def main():
     parser.add_argument("--timeout", type=positive, default=60, help="network timeout in seconds")
     parser.add_argument("--dry-run", action="store_true", help="read package DBs, hash local files, and report downloads; no writes")
     parser.add_argument("--prune", action="store_true", help="remove obsolete packages in selected repos after successful sync")
+    parser.add_argument("--recover-null-records", action="store_true",
+                        help="recover all-NUL .db records from .files for package staging only; exits 3 if needed")
+    parser.add_argument("--allow-files-only", action="append", default=[], metavar="ARCH/REPO/FILENAME",
+                        help="allow this exact investigated .files-only package; exits 3 if needed; repeatable")
+    parser.add_argument("--json", action="store_true", help="print the result as JSON; progress goes to stderr")
     args = parser.parse_args()
     upstream = urlsplit(args.upstream)
     if upstream.scheme not in ("https", "http") or not upstream.netloc or upstream.query or upstream.fragment:
@@ -361,19 +429,43 @@ def main():
         parser.error("--stage must be a dedicated mirror directory, not /")
     args.arch = list(dict.fromkeys(args.arch or ["aarch64"]))
     args.repos = list(dict.fromkeys(args.repos))
+    for exception in args.allow_files_only:
+        parts = exception.split("/")
+        if (len(parts) != 3 or parts[0] not in args.arch or parts[1] not in args.repos
+                or not PACKAGE_NAME.fullmatch(parts[2])):
+            parser.error("--allow-files-only must name a selected ARCH/REPO and an exact package filename")
     try:
         if args.dry_run:
-            sync(args)
+            result = sync(args)
         else:
             with stage_lock(args.stage):
-                sync(args)
+                write_status(args, status_document(args, "running", metadata_published=False))
+                try:
+                    result = sync(args)
+                    write_status(args, result)
+                except BaseException as error:
+                    write_status(args, status_document(args, "failed", metadata_published=False,
+                                                       error=str(error) or type(error).__name__))
+                    raise
     except (SyncError, OSError, URLError, HTTPException) as error:
+        if args.json:
+            print(json.dumps(status_document(args, "failed", error=str(error))))
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("Interrupted; rerun to reuse completed downloads.", file=sys.stderr)
         return 130
-    return 0
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    elif result["status"] == "degraded":
+        print(f"Degraded: {result['package_count']:,} manifest packages; "
+              "metadata/freshness not published; pruning skipped. Wait for corrected upstream metadata.")
+    elif args.dry_run:
+        print(f"Dry run: {result['package_count']:,} packages; {result['downloads']:,} downloads needed.")
+    else:
+        print(f"Complete: {result['packages_verified']:,} packages verified; "
+              f"{result['downloads']:,} downloaded. Stage: {args.stage}")
+    return DEGRADED if result["status"] == "degraded" else 0
 
 
 if __name__ == "__main__":

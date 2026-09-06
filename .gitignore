@@ -1,3 +1,5 @@
 /stage-arm/
 /stage-arm.lock
+/stage-arm.status.json
+/.firecrawl/
 __pycache__/
