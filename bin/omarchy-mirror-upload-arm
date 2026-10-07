@@ -90,6 +90,9 @@ NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --ex
 INDEX_CHANGED=(--checksum)
 if [[ $STAGE == *:* ]]; then
   PACKAGE_CHANGED=(--checksum)
+  # A copy inside R2 moves no data through this machine, only one request per
+  # object, so more of them can be in flight: 127 objects/s against 80 at 64.
+  COMMON+=(--transfers=256)
 else
   PACKAGE_CHANGED=(--update --use-server-modtime)
 fi
