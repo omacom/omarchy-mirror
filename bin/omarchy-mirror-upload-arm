@@ -44,24 +44,34 @@ if [[ $STAGE != *:* ]]; then
   fi
 fi
 
-# --update with --use-server-modtime compares a file's time with the time R2
-# received its copy, so an unchanged file costs no request beyond the listing
-# and a package replaced under the same name is uploaded again.
-COMMON=(--fast-list --update --use-server-modtime --s3-no-head --s3-disable-checksum
+COMMON=(--fast-list --s3-no-head --s3-disable-checksum
   --transfers=64 --checkers=64 --s3-upload-concurrency=8 --s3-chunk-size=32M $VERBOSE_RCLONE)
 INDEX=(--include '**/*.db' --include '**/*.db.*' --include '**/*.files' --include '**/*.files.*' --include '**/lastsync')
 NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --exclude '**/*.files.*' --exclude '**/lastsync')
 
+# How a file is judged unchanged. Databases are small and are what clients
+# read first, so they are always compared by checksum. Between two buckets
+# everything is: the listing carries the checksum, so it costs nothing.
+# Packages from the local stage are compared by time instead (reading 50 GiB
+# to checksum it every hour is not worth it): a file is uploaded when it is
+# newer than the copy R2 received, which is every file the stager wrote.
+INDEX_CHANGED=(--checksum)
+if [[ $STAGE == *:* ]]; then
+  PACKAGE_CHANGED=(--checksum)
+else
+  PACKAGE_CHANGED=(--update --use-server-modtime)
+fi
+
 # 1) Packages and signatures (no deletes)
 echo "Upload packages from $STAGE to $R2"
-rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${NOT_INDEX[@]}"
+rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@]}"
 
 # 2) Publish db/files + freshness markers, now that every package they name is there
 echo "Upload db/files + lastsync from $STAGE to $R2"
-rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX[@]}"
+rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${INDEX[@]}"
 
 # 3) Prune what is no longer in the stage (safe after the databases)
 echo "Prune removed packages on $R2"
-rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${NOT_INDEX[@]}"
+rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@]}"
 
 echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"
