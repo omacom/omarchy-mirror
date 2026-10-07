@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 UPSTREAM="https://fl.us.mirror.archlinuxarm.org"
 KEYRING="/etc/omarchy-mirror/alarm-build.gpg"
 ALLOW_FILE="$SCRIPT_DIR/../config/arm-allow-files-only"
+NULL_FILE="$SCRIPT_DIR/../config/arm-allow-null-records"
 VERBOSE=""
 
 while [[ $# -gt 0 ]]; do
@@ -43,13 +44,16 @@ done
 
 : "${STAGE:?--stage is required}" "${R2:?--r2 is required}"
 
-# Upstream's known stale .files records, one ARCH/REPO/FILENAME per line.
+# Upstream's known defects, one per line: stale .files records as
+# ARCH/REPO/FILENAME and all-NUL .db records as ARCH/REPO/MEMBER. Anything
+# else of either kind fails the run.
 allow=()
-if [[ -f $ALLOW_FILE ]]; then
-  while read -r entry; do
-    [[ -z $entry || $entry == \#* ]] || allow+=(--allow-files-only "$entry")
-  done <"$ALLOW_FILE"
-fi
+while read -r entry; do
+  [[ -z $entry || $entry == \#* ]] || allow+=(--allow-files-only "$entry")
+done <"$ALLOW_FILE"
+while read -r entry; do
+  [[ -z $entry || $entry == \#* ]] || allow+=(--allow-null-record "$entry")
+done <"$NULL_FILE"
 
 echo "Start syncing Omarchy ARM mirror"
 

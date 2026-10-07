@@ -35,4 +35,28 @@ if [[ $FROM != *:* || $TO != *:* ]]; then
   exit 1
 fi
 
-exec "$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$FROM" --r2 "$TO"
+# The source may be published to while it is being copied, which could leave
+# the destination with newer databases than packages. Copy again until the
+# source's databases are the same before and after.
+databases() {
+  rclone md5sum "$FROM" --fast-list --include '**/*.db' --include '**/*.files' | sort
+}
+
+for attempt in 1 2 3; do
+  before=$(databases)
+  if [[ -z $before ]]; then
+    echo "Refusing to promote $FROM: it has no databases" >&2
+    exit 1
+  fi
+
+  "$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$FROM" --r2 "$TO"
+
+  if [[ $(databases) == "$before" ]]; then
+    echo "Promoted $FROM to $TO"
+    exit 0
+  fi
+  echo "$FROM changed during the copy; copying again ($attempt/3)"
+done
+
+echo "Gave up: $FROM kept changing. $TO may be inconsistent; run this again" >&2
+exit 1

@@ -231,6 +231,28 @@ def download(args, relative, package):
         raise SyncError(f"Cannot download {relative}/{package.name}: HTTP {error.code}; rerun to refresh databases") from error
 
 
+def verified_path(args):
+    return args.stage.with_name(args.stage.name + ".verified.json")
+
+
+def verified_record(args):
+    """Packages whose signature this keyring has already verified, as sha256:signature-sha256."""
+    if not args.keyring:
+        return set()
+    try:
+        document = json.loads(verified_path(args).read_text())
+        if document["keyring_sha256"] == hashlib.sha256(args.keyring.read_bytes()).hexdigest():
+            return set(document["verified"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return set()
+
+
+def write_verified_record(args, proven):
+    document = dict(keyring_sha256=hashlib.sha256(args.keyring.read_bytes()).hexdigest(), verified=sorted(proven))
+    atomic_write(verified_path(args), (json.dumps(document) + "\n").encode())
+
+
 @contextmanager
 def stage_lock(stage):
     # Keep internal state outside the tree that could later be uploaded.
@@ -310,6 +332,9 @@ def sync(args):
             packages = package_manifest.packages
             if package_manifest.recovered:
                 for member, reason in package_manifest.recovered:
+                    if args.allow_null_record and f"{relative}/{member}" not in args.allow_null_record:
+                        raise SyncError(f"{relative}: all-NUL {repo}.db record {member} is not an allowed one; "
+                                        f"investigate before adding --allow-null-record {relative}/{member}")
                     progress(f"{relative}: WARNING: recovered malformed {repo}.db record {member} "
                              f"from the exact matching {repo}.files record ({reason}); metadata remains degraded")
             if any(packages[name] != package
@@ -328,8 +353,11 @@ def sync(args):
                 progress(f"{relative}: upstream .files omits {len(missing_from_files)} packages; "
                          "preserving upstream metadata and downloading all .db packages")
             degraded |= bool(package_manifest.recovered or files_only)
-            missing = [package for package in packages.values()
-                       if not valid_package(args.stage / relative / package.name, package)]
+            # hashlib releases the GIL, so the threads hash on separate cores.
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                valid = pool.map(lambda package: valid_package(args.stage / relative / package.name, package),
+                                 packages.values())
+                missing = [package for package, staged in zip(packages.values(), valid) if not staged]
             size = sum(package.size for package in packages.values())
             needed = sum(package.size for package in missing)
             progress(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
@@ -371,6 +399,7 @@ def sync(args):
             metadata[f"{relative}/{repo}.{kind}.tar.gz.sig"] = signature
 
     transfer_packages(args, pending)
+    downloaded = {(relative, package.name) for relative, package in pending}
 
     # Detect a rolling upstream before exposing any new repository metadata.
     for relative, (repo, _, _, _) in snapshots.items():
@@ -383,16 +412,30 @@ def sync(args):
                 raise SyncError(f"{relative}: upstream metadata signature changed; rerun to finish")
 
     # PGPSIG is the original detached signature, base64-encoded in the database.
-    # A package staged before its signature was checked (an earlier run without
-    # --keyring, or a signature that changed upstream) is checked here.
-    downloaded = {(relative, package.name) for relative, package in pending}
+    # A .sig file on disk proves nothing: a run without --keyring writes it too.
+    # Verified packages are remembered by content instead, per keyring, so one
+    # staged before its signature was checked is checked here.
+    record = verified_record(args)
+    proven = set() if args.keyring else None
+    unchecked = []
     for relative, (_, _, _, packages) in snapshots.items():
         for package in packages.values():
-            signature_path = args.stage / relative / (package.name + ".sig")
-            if (args.keyring and (relative, package.name) not in downloaded
-                    and not (signature_path.is_file() and signature_path.read_bytes() == package.signature)):
-                verify_signature(args, args.stage / relative / package.name, package, f"{relative}/{package.name}")
-            atomic_write(signature_path, package.signature)
+            if args.keyring:
+                proof = f"{package.sha256}:{hashlib.sha256(package.signature).hexdigest()}"
+                proven.add(proof)
+                if (relative, package.name) not in downloaded and proof not in record:
+                    unchecked.append((relative, package))
+    if unchecked:
+        progress(f"Checking {len(unchecked):,} signatures of packages staged earlier")
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for _ in pool.map(lambda item: verify_signature(args, args.stage / item[0] / item[1].name, item[1],
+                                                            f"{item[0]}/{item[1].name}"), unchecked):
+                pass
+    if args.keyring:
+        write_verified_record(args, proven)
+    for relative, (_, _, _, packages) in snapshots.items():
+        for package in packages.values():
+            atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
     if degraded and not args.publish_degraded:
         return status_document(args, "degraded", metadata_published=False,
                                repositories=repositories, package_count=total,
@@ -445,6 +488,9 @@ def main():
     parser.add_argument("--prune", action="store_true", help="remove obsolete packages in selected repos after successful sync")
     parser.add_argument("--recover-null-records", action="store_true",
                         help="recover all-NUL .db records from .files for package staging only; exits 3 if needed")
+    parser.add_argument("--allow-null-record", action="append", default=[], metavar="ARCH/REPO/MEMBER",
+                        help="with --recover-null-records, recover only this exact investigated record; "
+                             "any other all-NUL record fails; repeatable")
     parser.add_argument("--allow-files-only", action="append", default=[], metavar="ARCH/REPO/FILENAME",
                         help="allow this exact investigated .files-only package; exits 3 if needed; repeatable")
     parser.add_argument("--publish-degraded", action="store_true",
