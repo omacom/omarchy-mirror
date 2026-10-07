@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -34,6 +35,10 @@ DEGRADED = 3
 
 class SyncError(Exception):
     pass
+
+
+class SignatureError(SyncError):
+    """A package that does not verify; downloading it again cannot help."""
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,8 @@ def retry(operation, attempts):
     for attempt in range(attempts):
         try:
             return operation()
+        except SignatureError:
+            raise
         except HTTPError as error:
             if error.code not in (408, 429, 500, 502, 503, 504):
                 raise
@@ -163,6 +170,17 @@ def valid_package(path, package):
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest() == package.sha256
+
+
+def verify_signature(args, path, package, label):
+    """Check the database's detached signature against the pinned gpgv keyring."""
+    with tempfile.NamedTemporaryFile(prefix=".arm-", suffix=".sig") as signature:
+        signature.write(package.signature)
+        signature.flush()
+        result = subprocess.run(["gpgv", "--quiet", "--keyring", str(args.keyring), signature.name, str(path)],
+                                capture_output=True)
+    if result.returncode != 0:
+        raise SignatureError(f"Signature does not verify: {label}")
 
 
 def atomic_write(path, data):
@@ -201,6 +219,8 @@ def download(args, relative, package):
                 os.fchmod(destination.fileno(), 0o644)
             if size != package.size or digest.hexdigest() != package.sha256:
                 raise SyncError(f"Checksum/size mismatch: {relative}/{package.name}")
+            if args.keyring:
+                verify_signature(args, temporary, package, f"{relative}/{package.name}")
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -333,7 +353,7 @@ def sync(args):
     if args.dry_run:
         if required + GIB > free:
             raise SyncError("Insufficient space for this sync (includes 1 GiB headroom)")
-        return status_document(args, "degraded" if degraded else "dry_run", dry_run=True,
+        return status_document(args, "degraded" if degraded and not args.publish_degraded else "dry_run", dry_run=True,
                                metadata_published=False, repositories=repositories,
                                package_count=total, downloads=len(pending))
     if required + GIB > free:
@@ -363,10 +383,17 @@ def sync(args):
                 raise SyncError(f"{relative}: upstream metadata signature changed; rerun to finish")
 
     # PGPSIG is the original detached signature, base64-encoded in the database.
+    # A package staged before its signature was checked (an earlier run without
+    # --keyring, or a signature that changed upstream) is checked here.
+    downloaded = {(relative, package.name) for relative, package in pending}
     for relative, (_, _, _, packages) in snapshots.items():
         for package in packages.values():
-            atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
-    if degraded:
+            signature_path = args.stage / relative / (package.name + ".sig")
+            if (args.keyring and (relative, package.name) not in downloaded
+                    and not (signature_path.is_file() and signature_path.read_bytes() == package.signature)):
+                verify_signature(args, args.stage / relative / package.name, package, f"{relative}/{package.name}")
+            atomic_write(signature_path, package.signature)
+    if degraded and not args.publish_degraded:
         return status_document(args, "degraded", metadata_published=False,
                                repositories=repositories, package_count=total,
                                packages_verified=total, downloads=len(pending))
@@ -390,7 +417,8 @@ def sync(args):
     checked_at = int(time.time())
     for relative in snapshots:
         atomic_write(args.stage / relative / "lastsync", f"{checked_at}\n".encode())
-    return status_document(args, "complete", metadata_published=True,
+    return status_document(args, "complete", metadata_published=True, published_degraded=degraded,
+                           signatures_verified=bool(args.keyring),
                            repositories=repositories, package_count=total,
                            packages_verified=total, downloads=len(pending))
 
@@ -419,12 +447,23 @@ def main():
                         help="recover all-NUL .db records from .files for package staging only; exits 3 if needed")
     parser.add_argument("--allow-files-only", action="append", default=[], metavar="ARCH/REPO/FILENAME",
                         help="allow this exact investigated .files-only package; exits 3 if needed; repeatable")
+    parser.add_argument("--publish-degraded", action="store_true",
+                        help="publish upstream metadata unchanged even when --recover-null-records or "
+                             "--allow-files-only was needed, as every upstream mirror does; exits 0")
+    parser.add_argument("--keyring", type=Path, metavar="FILE",
+                        help="gpgv keyring; every package must carry a signature from it before it is staged")
     parser.add_argument("--json", action="store_true", help="print the result as JSON; progress goes to stderr")
     args = parser.parse_args()
     upstream = urlsplit(args.upstream)
     if upstream.scheme not in ("https", "http") or not upstream.netloc or upstream.query or upstream.fragment:
         parser.error("--upstream must be an HTTP(S) mirror root without a query or fragment")
     args.stage = args.stage.expanduser().resolve()
+    if args.keyring:
+        args.keyring = args.keyring.expanduser().resolve()
+        if not args.keyring.is_file():
+            parser.error("--keyring must be an existing gpgv keyring file")
+        if shutil.which("gpgv") is None:
+            parser.error("--keyring needs gpgv on PATH")
     if args.stage == args.stage.parent:
         parser.error("--stage must be a dedicated mirror directory, not /")
     args.arch = list(dict.fromkeys(args.arch or ["aarch64"]))
