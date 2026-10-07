@@ -58,7 +58,7 @@ done <"$NULL_FILE"
 echo "Start syncing Omarchy ARM mirror"
 
 "$SCRIPT_DIR/omarchy-mirror-stage-arm" --stage "$STAGE" --upstream "$UPSTREAM" \
-  --repos core extra alarm --workers 16 --prune --keyring "$KEYRING" \
+  --repos core extra alarm aur --workers 16 --prune --keyring "$KEYRING" \
   --recover-null-records --publish-degraded "${allow[@]}"
 "$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$STAGE" --r2 "$R2" ${VERBOSE:+--verbose}
 
