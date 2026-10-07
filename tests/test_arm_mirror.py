@@ -368,7 +368,7 @@ class MirrorTest(unittest.TestCase):
     def test_insufficient_space_fails_before_downloads(self):
         args = SimpleNamespace(stage=self.stage, upstream=self.upstream,
                                arch=["aarch64"], repos=["core"], dry_run=False,
-                               timeout=2, retries=1, recover_null_records=False, allow_files_only=[])
+                               timeout=2, retries=1, workers=1, recover_null_records=False, allow_files_only=[])
         with patch("shutil.disk_usage", return_value=SimpleNamespace(free=1)):
             with redirect_stderr(io.StringIO()):
                 with self.assertRaisesRegex(API["SyncError"], "Insufficient disk space"):
@@ -468,10 +468,36 @@ class MirrorTest(unittest.TestCase):
         keyring = str(Path(self.temporary.name) / "builder.gpg")
         self.publish([bad])
         self.run_sync()
-        repo = self.stage / "aarch64/core"
-        (repo / (bad[0] + ".sig")).unlink()
+        # The run without a keyring left the package and its .sig in place.
+        self.assertTrue((self.stage / "aarch64/core" / (bad[0] + ".sig")).is_file())
         result = self.run_sync("--keyring", keyring, success=False)
         self.assertIn("Signature does not verify", result.stderr)
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_verified_packages_are_remembered_per_keyring(self):
+        good = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "builder@test")
+        keyring = Path(self.temporary.name) / "builder.gpg"
+        self.publish([good])
+        self.run_sync("--keyring", str(keyring))
+        record = self.stage.with_name(self.stage.name + ".verified.json")
+        self.assertEqual(len(json.loads(record.read_text())["verified"]), 1)
+        # A different keyring does not inherit what the first one verified.
+        home = Path(self.temporary.name) / "gnupg"
+        other = Path(self.temporary.name) / "stranger.gpg"
+        other.write_bytes(subprocess.run(["gpg", "--homedir", str(home), "--export", "stranger@test"],
+                                         check=True, capture_output=True).stdout)
+        result = self.run_sync("--keyring", str(other), success=False)
+        self.assertIn("Signature does not verify", result.stderr)
+
+    def test_null_recovery_can_be_limited_to_named_records(self):
+        self.run_sync()
+        record_name = "findnewest-0.3-4"
+        self.files[PREFIX + "core.db"] = null_database(record_name)
+        self.files[PREFIX + "core.files"] = database([self.first], [record_name])
+        result = self.run_sync("--recover-null-records", "--allow-null-record", "aarch64/core/other-1-1/desc",
+                               success=False)
+        self.assertIn("is not an allowed one", result.stderr)
+        self.run_sync("--recover-null-records", "--allow-null-record", f"aarch64/core/{record_name}/desc", code=3)
 
 
 if __name__ == "__main__":

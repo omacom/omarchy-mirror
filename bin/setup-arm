@@ -5,7 +5,12 @@
 
 set -euo pipefail
 
-apt-get install -y rclone gnupg python3
+apt-get install -y gnupg python3 curl
+
+# Debian and Ubuntu package an rclone that is years old.
+curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+apt-get install -y /tmp/rclone.deb
+rm -f /tmp/rclone.deb
 
 # Arch Linux ARM signs every package with one build key and does not sign its
 # databases, so each package is checked against that key, pinned by fingerprint.

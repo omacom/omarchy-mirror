@@ -33,19 +33,49 @@ done
 : "${STAGE:?--stage is required}" "${R2:?--r2 is required}"
 STAGE="${STAGE%/}"
 
-# Only a stage whose last run completed may be uploaded: a running, failed or
-# degraded run can leave databases that name packages which are not there.
+# Only a stage whose last run completed, covered every repository in it and
+# checked every signature may be uploaded: anything else can leave databases
+# that name packages which are missing or unverified. The stager's own lock is
+# held throughout, so the tree cannot change between the three steps.
 if [[ $STAGE != *:* ]]; then
+  exec 9>>"$STAGE.lock"
+  if ! flock -n 9; then
+    echo "Refusing to upload $STAGE: a stage run is using it" >&2
+    exit 1
+  fi
+
   status="$STAGE.status.json"
-  state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status"))' "$status" 2>/dev/null || echo missing)
-  if [[ $state != complete ]]; then
-    echo "Refusing to upload $STAGE: last stage run is '$state' ($status)" >&2
+  if ! problem=$(python3 - "$status" "$STAGE" 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+
+try:
+    report = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit("there is no readable status report")
+if report.get("status") != "complete":
+    sys.exit(f"last stage run is '{report.get('status')}'")
+if report.get("signatures_verified") is not True:
+    sys.exit("last stage run did not check signatures (--keyring)")
+staged = {f"{arch.name}/{repo.name}" for arch in Path(sys.argv[2]).iterdir() if arch.is_dir()
+          for repo in arch.iterdir() if repo.is_dir()}
+skipped = sorted(staged - set(report.get("selected_repositories", [])))
+if skipped:
+    sys.exit(f"last stage run did not cover {', '.join(skipped)}")
+PY
+  ); then
+    echo "Refusing to upload $STAGE: $problem ($status)" >&2
     exit 1
   fi
 fi
 
-COMMON=(--fast-list --s3-no-head --s3-disable-checksum
-  --transfers=64 --checkers=64 --s3-upload-concurrency=8 --s3-chunk-size=32M $VERBOSE_RCLONE)
+# Packages above 200 MiB go up in parts (R2 takes 5 GiB in one request, 5 TiB
+# in parts). The checksum R2 lists for those is not the file's, so rclone
+# stores the file's MD5 with the object; a promote compares by it, and without
+# it a same-size replacement would go unnoticed. Parts are buffered in memory:
+# at most transfers x concurrency x chunk size, 4 GiB here.
+COMMON=(--fast-list --s3-no-head --transfers=64 --checkers=64
+  --s3-upload-concurrency=4 --s3-chunk-size=16M $VERBOSE_RCLONE)
 INDEX=(--include '**/*.db' --include '**/*.db.*' --include '**/*.files' --include '**/*.files.*' --include '**/lastsync')
 NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --exclude '**/*.files.*' --exclude '**/lastsync')
 
@@ -54,7 +84,9 @@ NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --ex
 # everything is: the listing carries the checksum, so it costs nothing.
 # Packages from the local stage are compared by time instead (reading 50 GiB
 # to checksum it every hour is not worth it): a file is uploaded when it is
-# newer than the copy R2 received, which is every file the stager wrote.
+# newer than the copy R2 received, which is every file the stager wrote. It
+# would miss a same-name replacement stamped older than its upload, so keep
+# the clock synced and do not restore a stage with its old timestamps.
 INDEX_CHANGED=(--checksum)
 if [[ $STAGE == *:* ]]; then
   PACKAGE_CHANGED=(--checksum)
@@ -71,7 +103,7 @@ echo "Upload db/files + lastsync from $STAGE to $R2"
 rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${INDEX[@]}"
 
 # 3) Prune what is no longer in the stage (safe after the databases)
-echo "Prune removed packages on $R2"
-rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@]}"
+echo "Prune removed files on $R2"
+rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}"
 
 echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"
