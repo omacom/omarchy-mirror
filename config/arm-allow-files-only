@@ -1,0 +1,3 @@
+# Stale records in Arch Linux ARM's .files databases: named there, absent from
+# the .db and from the package directory. One ARCH/REPO/FILENAME per line.
+aarch64/extra/qemu-system-cris-9.1.2-1-aarch64.pkg.tar.xz

@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Copy one ARM mirror bucket onto another without going back to upstream:
+# edge to rc when a release candidate is cut, rc to stable on release day.
+# Both buckets are on the same R2 account, so the copies happen server-side.
+#
+#   omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm --to omarchy:omarchy-mirror-arm-rc
+#   omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-rc --to omarchy:omarchy-mirror-arm-stable
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --from)
+    FROM="$2"
+    shift 2
+    ;;
+  --to)
+    TO="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown option: $1"
+    echo "Usage: $0 --from R2 --to R2"
+    exit 1
+    ;;
+  esac
+done
+
+: "${FROM:?--from is required}" "${TO:?--to is required}"
+if [[ $FROM != *:* || $TO != *:* ]]; then
+  echo "Both --from and --to must be remote:bucket" >&2
+  exit 1
+fi
+
+exec "$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$FROM" --r2 "$TO"
