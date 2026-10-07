@@ -407,6 +407,72 @@ class MirrorTest(unittest.TestCase):
             self.assertEqual((self.stage / f"aarch64/{repo}/lastsync").read_text(), "old freshness")
         self.assertTrue((self.stage / "aarch64/extra" / extra[0]).exists())
 
+    def test_publish_degraded_publishes_upstream_metadata_unchanged(self):
+        record_name = "findnewest-0.3-4"
+        self.files[PREFIX + "core.db"] = null_database(record_name)
+        self.files[PREFIX + "core.files"] = database([self.first], [record_name])
+        self.run_sync("--recover-null-records", code=3)
+        repo = self.stage / "aarch64/core"
+        self.assertFalse((repo / "core.db").exists())
+        result = self.run_sync("--recover-null-records", "--publish-degraded", "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["metadata_published"])
+        self.assertTrue(report["published_degraded"])
+        self.assertEqual((repo / "core.db").read_bytes(), self.files[PREFIX + "core.db"])
+        self.assertEqual((repo / self.first[0]).read_bytes(), self.first[1])
+        self.assertTrue((repo / "lastsync").is_file())
+        # Without recovery the malformed record still fails closed.
+        self.run_sync("--publish-degraded", success=False)
+
+    def signed(self, name, body, signer):
+        home = Path(self.temporary.name) / "gnupg"
+        if not home.exists():
+            home.mkdir(mode=0o700)
+            for user in ("builder@test", "stranger@test"):
+                subprocess.run(["gpg", "--homedir", str(home), "--batch", "--quiet", "--passphrase", "",
+                                "--quick-generate-key", user, "ed25519", "sign", "never"],
+                               check=True, capture_output=True)
+            keyring = subprocess.run(["gpg", "--homedir", str(home), "--export", "builder@test"],
+                                     check=True, capture_output=True).stdout
+            (Path(self.temporary.name) / "builder.gpg").write_bytes(keyring)
+        package = Path(self.temporary.name) / "to-sign"
+        package.write_bytes(body)
+        signature = subprocess.run(["gpg", "--homedir", str(home), "--batch", "--quiet", "--local-user", signer,
+                                    "--detach-sign", "--output", "-", str(package)],
+                                   check=True, capture_output=True).stdout
+        return (name, body, signature)
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_keyring_rejects_packages_not_signed_by_the_pinned_key(self):
+        good = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "builder@test")
+        keyring = str(Path(self.temporary.name) / "builder.gpg")
+        self.publish([good])
+        result = self.run_sync("--keyring", keyring, "--json")
+        self.assertTrue(json.loads(result.stdout)["signatures_verified"])
+        repo = self.stage / "aarch64/core"
+        self.assertEqual((repo / good[0]).read_bytes(), good[1])
+        bad = self.signed("other-1-1-aarch64.pkg.tar.xz", b"second package", "stranger@test")
+        self.publish([good, bad])
+        old_db = (repo / "core.db").read_bytes()
+        result = self.run_sync("--keyring", keyring, success=False)
+        self.assertIn("Signature does not verify: aarch64/core/" + bad[0], result.stderr)
+        self.assertFalse((repo / bad[0]).exists())
+        self.assertEqual((repo / "core.db").read_bytes(), old_db)
+        # Not retried: the same bytes would fail the same way.
+        self.assertEqual(self.requests[PREFIX + bad[0]], 1)
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_keyring_checks_packages_staged_before_it_was_given(self):
+        bad = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "stranger@test")
+        keyring = str(Path(self.temporary.name) / "builder.gpg")
+        self.publish([bad])
+        self.run_sync()
+        repo = self.stage / "aarch64/core"
+        (repo / (bad[0] + ".sig")).unlink()
+        result = self.run_sync("--keyring", keyring, success=False)
+        self.assertIn("Signature does not verify", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
