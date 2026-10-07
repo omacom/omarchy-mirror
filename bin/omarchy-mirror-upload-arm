@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# Upload a complete Arch Linux ARM stage to R2: packages first, then the
+# databases that name them, then prune. The same three steps copy one bucket
+# onto another (omarchy-mirror-promote-arm), where R2 copies server-side.
+
+set -euo pipefail
+
+VERBOSE_RCLONE=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --stage)
+    STAGE="$2"
+    shift 2
+    ;;
+  --r2)
+    R2="$2"
+    shift 2
+    ;;
+  --verbose)
+    VERBOSE_RCLONE="-v"
+    shift
+    ;;
+  *)
+    echo "Unknown option: $1"
+    echo "Usage: $0 --stage STAGE --r2 R2 [--verbose]"
+    exit 1
+    ;;
+  esac
+done
+
+: "${STAGE:?--stage is required}" "${R2:?--r2 is required}"
+STAGE="${STAGE%/}"
+
+# Only a stage whose last run completed may be uploaded: a running, failed or
+# degraded run can leave databases that name packages which are not there.
+if [[ $STAGE != *:* ]]; then
+  status="$STAGE.status.json"
+  state=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status"))' "$status" 2>/dev/null || echo missing)
+  if [[ $state != complete ]]; then
+    echo "Refusing to upload $STAGE: last stage run is '$state' ($status)" >&2
+    exit 1
+  fi
+fi
+
+# --update with --use-server-modtime compares a file's time with the time R2
+# received its copy, so an unchanged file costs no request beyond the listing
+# and a package replaced under the same name is uploaded again.
+COMMON=(--fast-list --update --use-server-modtime --s3-no-head --s3-disable-checksum
+  --transfers=64 --checkers=64 --s3-upload-concurrency=8 --s3-chunk-size=32M $VERBOSE_RCLONE)
+INDEX=(--include '**/*.db' --include '**/*.db.*' --include '**/*.files' --include '**/*.files.*' --include '**/lastsync')
+NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --exclude '**/*.files.*' --exclude '**/lastsync')
+
+# 1) Packages and signatures (no deletes)
+echo "Upload packages from $STAGE to $R2"
+rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${NOT_INDEX[@]}"
+
+# 2) Publish db/files + freshness markers, now that every package they name is there
+echo "Upload db/files + lastsync from $STAGE to $R2"
+rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX[@]}"
+
+# 3) Prune what is no longer in the stage (safe after the databases)
+echo "Prune removed packages on $R2"
+rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${NOT_INDEX[@]}"
+
+echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"

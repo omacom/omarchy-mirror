@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Stage Arch Linux ARM locally, with every package signature checked, then
+# upload the stage to R2. The ARM counterpart of omarchy-mirror-sync.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+UPSTREAM="https://fl.us.mirror.archlinuxarm.org"
+KEYRING="/etc/omarchy-mirror/alarm-build.gpg"
+ALLOW_FILE="$SCRIPT_DIR/../config/arm-allow-files-only"
+VERBOSE=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --upstream)
+    UPSTREAM="$2"
+    shift 2
+    ;;
+  --stage)
+    STAGE="$2"
+    shift 2
+    ;;
+  --r2)
+    R2="$2"
+    shift 2
+    ;;
+  --keyring)
+    KEYRING="$2"
+    shift 2
+    ;;
+  --verbose)
+    VERBOSE=true
+    shift
+    ;;
+  *)
+    echo "Unknown option: $1"
+    echo "Usage: $0 --stage STAGE --r2 R2 [--upstream UPSTREAM] [--keyring FILE] [--verbose]"
+    exit 1
+    ;;
+  esac
+done
+
+: "${STAGE:?--stage is required}" "${R2:?--r2 is required}"
+
+# Upstream's known stale .files records, one ARCH/REPO/FILENAME per line.
+allow=()
+if [[ -f $ALLOW_FILE ]]; then
+  while read -r entry; do
+    [[ -z $entry || $entry == \#* ]] || allow+=(--allow-files-only "$entry")
+  done <"$ALLOW_FILE"
+fi
+
+echo "Start syncing Omarchy ARM mirror"
+
+"$SCRIPT_DIR/omarchy-mirror-stage-arm" --stage "$STAGE" --upstream "$UPSTREAM" \
+  --repos core extra alarm --workers 16 --prune --keyring "$KEYRING" \
+  --recover-null-records --publish-degraded "${allow[@]}"
+"$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$STAGE" --r2 "$R2" ${VERBOSE:+--verbose}
+
+echo "Finished syncing Omarchy ARM mirror in ${SECONDS}s"

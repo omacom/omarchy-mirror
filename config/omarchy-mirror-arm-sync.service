@@ -1,0 +1,12 @@
+[Unit]
+Description=Omarchy Arch Linux ARM Mirror Sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/omarchy-mirror/r2.env
+ExecStart=/root/omarchy-mirror/bin/omarchy-mirror-sync-arm --stage "/var/lib/omarchy-mirror/arm/" --r2 "omarchy:omarchy-mirror-arm"
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

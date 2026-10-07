@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# Meant to be run as root on an Ubuntu machine, from /root/omarchy-mirror.
+# Sets up the Arch Linux ARM mirror only; bin/setup is the x86_64 one.
+
+set -euo pipefail
+
+apt-get install -y rclone gnupg python3
+
+# Arch Linux ARM signs every package with one build key and does not sign its
+# databases, so each package is checked against that key, pinned by fingerprint.
+fpr=68B3537F39A313B3E574D06777193F152BDBE6A6
+mkdir -p /etc/omarchy-mirror /var/lib/omarchy-mirror
+chmod 700 /etc/omarchy-mirror
+GNUPGHOME="$(mktemp -d)"
+export GNUPGHOME
+curl -sSfL -o "$GNUPGHOME/archlinuxarm.gpg" \
+  https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/archlinuxarm-keyring/archlinuxarm.gpg
+gpg --quiet --import "$GNUPGHOME/archlinuxarm.gpg"
+gpg --list-keys --with-colons "$fpr" | grep -q "^fpr:.*$fpr"
+gpg --export "$fpr" >/etc/omarchy-mirror/alarm-build.gpg
+rm -rf "$GNUPGHOME"
+
+if [[ ! -f /etc/omarchy-mirror/r2.env ]]; then
+  echo "You must create /etc/omarchy-mirror/r2.env (mode 600) with the RCLONE_CONFIG_OMARCHY_* values"
+fi
+
+cp /root/omarchy-mirror/config/omarchy-mirror-arm-sync.* /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now omarchy-mirror-arm-sync.timer

@@ -67,6 +67,39 @@ Allow additional space for database files, updates, and retained old packages. O
 
 The initial local pull verified 311 `core`, 12,895 `extra`, 75 `alarm`, and 12 `aur` packages (13,293 total, 50.59 GiB in the manifests, 51 GiB on disk). It detected a rolling update, reused 13,291 packages on rerun, fetched two changes, then verified all packages with zero downloads on the next run. Those results establish package integrity and reuse, not healthy metadata: the earlier script preserved the defective upstream `extra.db` and incorrectly treated recovery as a normal completion. The current strict/degraded distinction fixes that. Pruning remained off, retaining two obsolete packages. The ignored `stage-arm/` tree remains local; R2 was not used.
 
+### Publishing the ARM mirror to R2
+
+`bin/omarchy-mirror-sync-arm` is the hourly job: it stages `core`, `extra` and `alarm` with `omarchy-mirror-stage-arm`, then uploads the stage with `omarchy-mirror-upload-arm`. ARM has its own buckets and hosts, so the x86_64 prune in `omarchy-mirror-upload` cannot reach it:
+
+| Channel | Bucket | Host |
+| --- | --- | --- |
+| edge | `omarchy-mirror-arm` | `arm-mirror.omarchy.org` |
+| rc | `omarchy-mirror-arm-rc` | `arm-rc-mirror.omarchy.org` |
+| stable | `omarchy-mirror-arm-stable` | `arm-stable-mirror.omarchy.org` |
+
+The buckets keep ARM's layout, so the mirror line is `Server = https://arm-stable-mirror.omarchy.org/$arch/$repo`.
+
+Two options on the stager make it fit for unattended use:
+
+- `--keyring FILE` checks every package against a gpgv keyring before it is staged, using the signature the database carries. Arch Linux ARM signs every package with one build key (`68B3537F39A313B3E574D06777193F152BDBE6A6`) and does not sign its databases, so this is the only check that ties a package to its builder. A package that does not verify fails the run and is not retried. Packages staged before the keyring was given are checked when their signature file is written.
+- `--publish-degraded` publishes upstream's databases unchanged when `--recover-null-records` or `--allow-files-only` was needed. The two defects described below have been in `extra` since at least September 5, 2026, and every Arch Linux ARM mirror serves them; without this option the stage could never publish `extra`. The exceptions stay explicit: `config/arm-allow-files-only` lists the known stale `.files` records, and a new one fails the run until it is added.
+
+`omarchy-mirror-upload-arm` refuses a stage whose status report is not `complete`. It uploads packages and signatures first, then the databases, then prunes what the stage no longer holds. It compares each file's time with the time R2 received its copy, so an unchanged file costs nothing beyond the listing and a package replaced under the same name is uploaded again.
+
+rc and stable are never synced from upstream. `omarchy-mirror-promote-arm` copies one bucket onto another, server-side:
+
+```sh
+# When a release candidate is cut
+bin/omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm --to omarchy:omarchy-mirror-arm-rc
+
+# On release day
+bin/omarchy-mirror-promote-arm --from omarchy:omarchy-mirror-arm-rc --to omarchy:omarchy-mirror-arm-stable
+```
+
+`bin/setup-arm` installs the dependencies, the pinned keyring and the hourly timer. R2 credentials come from `/etc/omarchy-mirror/r2.env` (mode 600) as `RCLONE_CONFIG_OMARCHY_*` variables; a token limited to the three ARM buckets also needs `RCLONE_CONFIG_OMARCHY_NO_CHECK_BUCKET=true`.
+
+Cloudflare does not cache `.xz`, `.db`, `.files` or `.sig` by default, and every Arch Linux ARM package is a `.pkg.tar.xz`, so the three hosts need cache rules of their own: packages and signatures for a long time, databases for a minute.
+
 Run the integration tests without network access to public mirrors:
 
 ```sh
