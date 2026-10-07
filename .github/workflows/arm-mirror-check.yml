@@ -1,0 +1,78 @@
+name: ARM mirror check
+
+# Real pacman, on a real arm64 machine, against the published mirrors and
+# nothing else. Catches what the staging tests cannot: a host that is down,
+# a database naming a package that is not there, a signature that fails.
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/arm-mirror-check.yml
+
+permissions: {}
+
+jobs:
+  pacman:
+    runs-on: ubuntu-24.04-arm
+    container: menci/archlinuxarm@sha256:3e1074c407fc1a57c2a2117af6920c96a7cc906fa6f1f2da8a4a7fd3aa2c2f4e
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [arm-mirror, arm-rc-mirror, arm-stable-mirror]
+    steps:
+      - name: Use only ${{ matrix.host }}.omarchy.org
+        run: |
+          cat >/etc/pacman.conf <<'EOF'
+          [options]
+          Architecture = aarch64
+          SigLevel = Required DatabaseOptional
+          LocalFileSigLevel = Optional
+          ParallelDownloads = 8
+
+          [core]
+          Include = /etc/pacman.d/mirrorlist
+
+          [extra]
+          Include = /etc/pacman.d/mirrorlist
+
+          [alarm]
+          Include = /etc/pacman.d/mirrorlist
+
+          [aur]
+          Include = /etc/pacman.d/mirrorlist
+          EOF
+          echo 'Server = https://${{ matrix.host }}.omarchy.org/$arch/$repo' >/etc/pacman.d/mirrorlist
+
+      - name: Trust the Arch Linux ARM build key
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinuxarm
+
+      - name: Freshness
+        run: |
+          for repo in core extra alarm aur; do
+            stamp=$(curl -fsS "https://${{ matrix.host }}.omarchy.org/aarch64/$repo/lastsync")
+            echo "$repo: checked $(( ($(date +%s) - stamp) / 60 )) minutes ago"
+          done
+
+      - name: Full system upgrade
+        run: pacman -Syyu --noconfirm
+
+      - name: Every repository lists packages
+        run: |
+          for repo in core extra alarm aur; do
+            count=$(pacman -Slq "$repo" | wc -l)
+            echo "$repo: $count packages"
+            [ "$count" -gt 0 ]
+          done
+
+      - name: Install from extra and aur, and run what was installed
+        run: |
+          pacman -S --noconfirm --needed jq qrtr-git
+          jq --version
+
+      - name: Download and verify the kernel and three alarm packages
+        run: pacman -Sw --noconfirm linux-aarch64 $(pacman -Slq alarm | head -3)
