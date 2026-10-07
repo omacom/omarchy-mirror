@@ -1,0 +1,10 @@
+[Unit]
+Description=Omarchy ARM Mirror Promote RC to Stable — Last Monday @ 10am UTC of Each Month
+
+[Timer]
+OnCalendar=Mon *-*-24..31 10:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

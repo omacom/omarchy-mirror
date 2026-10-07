@@ -1,0 +1,12 @@
+[Unit]
+Description=Omarchy Arch Linux ARM Mirror Promote RC to Stable
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/omarchy-mirror/r2.env
+ExecStart=/root/omarchy-mirror/bin/omarchy-mirror-promote-arm --from "omarchy:omarchy-mirror-arm-rc" --to "omarchy:omarchy-mirror-arm-stable"
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

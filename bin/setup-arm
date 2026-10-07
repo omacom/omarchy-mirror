@@ -30,6 +30,8 @@ if [[ ! -f /etc/omarchy-mirror/r2.env ]]; then
   echo "You must create /etc/omarchy-mirror/r2.env (mode 600) with the RCLONE_CONFIG_OMARCHY_* values"
 fi
 
-cp /root/omarchy-mirror/config/omarchy-mirror-arm-sync.* /etc/systemd/system/
+cp /root/omarchy-mirror/config/omarchy-mirror-arm-*.service /root/omarchy-mirror/config/omarchy-mirror-arm-*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now omarchy-mirror-arm-sync.timer
+systemctl enable --now omarchy-mirror-arm-promote-rc.timer
+systemctl enable --now omarchy-mirror-arm-promote-stable.timer
