@@ -11,6 +11,7 @@ KEYRING="/etc/omarchy-mirror/alarm-build.gpg"
 ALLOW_FILE="$SCRIPT_DIR/../config/arm-allow-files-only"
 NULL_FILE="$SCRIPT_DIR/../config/arm-allow-null-records"
 VERBOSE=""
+STATELESS=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -30,13 +31,19 @@ while [[ $# -gt 0 ]]; do
     KEYRING="$2"
     shift 2
     ;;
+  --stateless)
+    # Keep no local copy of the mirror: the bucket's own listing says what
+    # it already holds, and only new packages pass through this machine.
+    STATELESS=true
+    shift
+    ;;
   --verbose)
     VERBOSE=true
     shift
     ;;
   *)
     echo "Unknown option: $1"
-    echo "Usage: $0 --stage STAGE --r2 R2 [--upstream UPSTREAM] [--keyring FILE] [--verbose]"
+    echo "Usage: $0 --stage STAGE --r2 R2 [--upstream UPSTREAM] [--keyring FILE] [--stateless] [--verbose]"
     exit 1
     ;;
   esac
@@ -57,9 +64,18 @@ done <"$NULL_FILE"
 
 echo "Start syncing Omarchy ARM mirror"
 
+STAGE="${STAGE%/}"
+mode=()
+if [[ -n $STATELESS ]]; then
+  mkdir -p "$(dirname "$STAGE")"
+  rclone lsjson "$R2" --recursive --files-only --hash --no-modtime --no-mimetype --fast-list >"$STAGE.listing.json"
+  echo "Bucket lists $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$STAGE.listing.json") objects"
+  mode=(--bucket-listing "$STAGE.listing.json")
+fi
+
 "$SCRIPT_DIR/omarchy-mirror-stage-arm" --stage "$STAGE" --upstream "$UPSTREAM" \
   --repos core extra alarm aur --workers 16 --prune --keyring "$KEYRING" \
-  --recover-null-records --publish-degraded "${allow[@]}"
-"$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$STAGE" --r2 "$R2" ${VERBOSE:+--verbose}
+  --recover-null-records --publish-degraded "${allow[@]}" "${mode[@]}"
+"$SCRIPT_DIR/omarchy-mirror-upload-arm" --stage "$STAGE" --r2 "$R2" ${STATELESS:+--delta} ${VERBOSE:+--verbose}
 
 echo "Finished syncing Omarchy ARM mirror in ${SECONDS}s"

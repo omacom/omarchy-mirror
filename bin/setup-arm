@@ -12,19 +12,9 @@ curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-
 apt-get install -y /tmp/rclone.deb
 rm -f /tmp/rclone.deb
 
-# Arch Linux ARM signs every package with one build key and does not sign its
-# databases, so each package is checked against that key, pinned by fingerprint.
-fpr=68B3537F39A313B3E574D06777193F152BDBE6A6
 mkdir -p /etc/omarchy-mirror /var/lib/omarchy-mirror
 chmod 700 /etc/omarchy-mirror
-GNUPGHOME="$(mktemp -d)"
-export GNUPGHOME
-curl -sSfL -o "$GNUPGHOME/archlinuxarm.gpg" \
-  https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/archlinuxarm-keyring/archlinuxarm.gpg
-gpg --quiet --import "$GNUPGHOME/archlinuxarm.gpg"
-gpg --list-keys --with-colons "$fpr" | grep -q "^fpr:.*$fpr"
-gpg --export "$fpr" >/etc/omarchy-mirror/alarm-build.gpg
-rm -rf "$GNUPGHOME"
+/root/omarchy-mirror/bin/omarchy-mirror-arm-keyring /etc/omarchy-mirror/alarm-build.gpg
 
 if [[ ! -f /etc/omarchy-mirror/r2.env ]]; then
   echo "You must create /etc/omarchy-mirror/r2.env (mode 600) with the RCLONE_CONFIG_OMARCHY_* values"

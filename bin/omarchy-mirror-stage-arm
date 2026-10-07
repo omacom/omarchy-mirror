@@ -47,6 +47,7 @@ class Package:
     size: int
     sha256: str
     signature: bytes
+    md5: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,12 @@ def package_from_desc(data):
     signature = base64.b64decode(signature, validate=True)
     if not signature:
         raise ValueError(f"empty signature: {name}")
-    return Package(name, int(size), digest.lower(), signature)
+    # MD5SUM is what an object store lists for an object, so it is how a
+    # package already in a bucket is recognised. It is never used to accept one.
+    md5 = fields.get("%MD5SUM%", [""])
+    if len(md5) != 1 or not re.fullmatch(r"[a-fA-F0-9]{32}|", md5[0]):
+        raise ValueError(f"invalid MD5: {name}")
+    return Package(name, int(size), digest.lower(), signature, md5[0].lower())
 
 
 def manifest(data, label, recovery=None):
@@ -120,6 +126,21 @@ def manifest(data, label, recovery=None):
     if not packages:
         raise SyncError(f"Empty repository database {label}; refusing to publish or prune")
     return Manifest(packages, records, tuple(recovered))
+
+
+def bucket_listing(path):
+    """Objects already published, as {key: (size, md5)}, from `rclone lsjson -R --hash`."""
+    try:
+        entries = json.loads(path.read_text())
+        return {entry["Path"]: (entry["Size"], entry.get("Hashes", {}).get("md5", "").lower())
+                for entry in entries if not entry.get("IsDir")}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise SyncError(f"Invalid bucket listing {path}: {error}") from error
+
+
+def published(listing, key, data_size, data_md5):
+    """True when the bucket holds exactly these bytes under this key."""
+    return bool(data_md5) and listing.get(key) == (data_size, data_md5)
 
 
 def remote_url(upstream, relative):
@@ -312,6 +333,10 @@ def transfer_packages(args, pending):
 
 
 def sync(args):
+    # With a bucket listing, the bucket is the stage: a package it already
+    # holds with the database's size and MD5 is neither downloaded nor kept
+    # here, and this directory only ever holds what is new.
+    listing = bucket_listing(args.bucket_listing) if args.bucket_listing else None
     snapshots = {}
     repositories = {}
     pending = []
@@ -353,11 +378,19 @@ def sync(args):
                 progress(f"{relative}: upstream .files omits {len(missing_from_files)} packages; "
                          "preserving upstream metadata and downloading all .db packages")
             degraded |= bool(package_manifest.recovered or files_only)
-            # hashlib releases the GIL, so the threads hash on separate cores.
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                valid = pool.map(lambda package: valid_package(args.stage / relative / package.name, package),
-                                 packages.values())
-                missing = [package for package, staged in zip(packages.values(), valid) if not staged]
+            if listing is not None:
+                unlisted = [package.name for package in packages.values() if not package.md5]
+                if unlisted:
+                    raise SyncError(f"{relative}: {len(unlisted)} records carry no MD5SUM (first: {unlisted[0]}); "
+                                    "a bucket listing cannot stand in for them")
+                missing = [package for package in packages.values()
+                           if not published(listing, f"{relative}/{package.name}", package.size, package.md5)]
+            else:
+                # hashlib releases the GIL, so the threads hash on separate cores.
+                with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                    valid = pool.map(lambda package: valid_package(args.stage / relative / package.name, package),
+                                     packages.values())
+                    missing = [package for package, staged in zip(packages.values(), valid) if not staged]
             size = sum(package.size for package in packages.values())
             needed = sum(package.size for package in missing)
             progress(f"{relative}: {len(packages):,} packages, {size / GIB:.2f} GiB; "
@@ -423,7 +456,9 @@ def sync(args):
             if args.keyring:
                 proof = f"{package.sha256}:{hashlib.sha256(package.signature).hexdigest()}"
                 proven.add(proof)
-                if (relative, package.name) not in downloaded and proof not in record:
+                # A package that is only in the bucket was checked by the run
+                # that uploaded it: the upload refuses a stage that was not.
+                if (relative, package.name) not in downloaded and proof not in record and listing is None:
                     unchecked.append((relative, package))
     if unchecked:
         progress(f"Checking {len(unchecked):,} signatures of packages staged earlier")
@@ -435,6 +470,9 @@ def sync(args):
         write_verified_record(args, proven)
     for relative, (_, _, _, packages) in snapshots.items():
         for package in packages.values():
+            if listing is not None and published(listing, f"{relative}/{package.name}.sig", len(package.signature),
+                                                 hashlib.md5(package.signature).hexdigest()):
+                continue
             atomic_write(args.stage / relative / (package.name + ".sig"), package.signature)
     if degraded and not args.publish_degraded:
         return status_document(args, "degraded", metadata_published=False,
@@ -457,11 +495,29 @@ def sync(args):
                     path.unlink()
                     removed += 1
         progress(f"Pruned {removed:,} obsolete package/signature files")
+
+    # What the upload should delete from the bucket: packages and signatures
+    # the databases no longer name, and metadata upstream dropped. Only keys
+    # in the selected repositories, and only names this tool could have put there.
+    obsolete = []
+    if listing is not None:
+        if args.prune:
+            for relative, (_, _, _, packages) in snapshots.items():
+                expected = set(packages) | {name + ".sig" for name in packages}
+                for key in listing:
+                    directory, _, name = key.rpartition("/")
+                    if (directory == relative and name not in expected
+                            and PACKAGE_NAME.fullmatch(name.removesuffix(".sig"))):
+                        obsolete.append(key)
+        obsolete += [relative for relative, data in metadata.items() if data is None and relative in listing]
+        atomic_write(args.stage.with_name(args.stage.name + ".obsolete"),
+                     "".join(key + "\n" for key in sorted(obsolete)).encode())
     checked_at = int(time.time())
     for relative in snapshots:
         atomic_write(args.stage / relative / "lastsync", f"{checked_at}\n".encode())
     return status_document(args, "complete", metadata_published=True, published_degraded=degraded,
                            signatures_verified=bool(args.keyring),
+                           bucket_listing=listing is not None, obsolete=len(obsolete),
                            repositories=repositories, package_count=total,
                            packages_verified=total, downloads=len(pending))
 
@@ -498,6 +554,10 @@ def main():
                              "--allow-files-only was needed, as every upstream mirror does; exits 0")
     parser.add_argument("--keyring", type=Path, metavar="FILE",
                         help="gpgv keyring; every package must carry a signature from it before it is staged")
+    parser.add_argument("--bucket-listing", type=Path, metavar="FILE",
+                        help="`rclone lsjson -R --hash` of the published bucket. Packages it already holds with the "
+                             "database's size and MD5 are not downloaded, so the stage holds only what is new; "
+                             "what should be deleted is written beside the stage. Needs --keyring")
     parser.add_argument("--json", action="store_true", help="print the result as JSON; progress goes to stderr")
     args = parser.parse_args()
     upstream = urlsplit(args.upstream)
@@ -510,6 +570,8 @@ def main():
             parser.error("--keyring must be an existing gpgv keyring file")
         if shutil.which("gpgv") is None:
             parser.error("--keyring needs gpgv on PATH")
+    if args.bucket_listing and not args.keyring:
+        parser.error("--bucket-listing needs --keyring: nothing unverified may reach the bucket")
     if args.stage == args.stage.parent:
         parser.error("--stage must be a dedicated mirror directory, not /")
     args.arch = list(dict.fromkeys(args.arch or ["aarch64"]))

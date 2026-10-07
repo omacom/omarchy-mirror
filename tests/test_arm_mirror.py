@@ -31,6 +31,7 @@ def database(records, record_names=None):
             desc = (f"%NAME%\n{package_name}\n\n%VERSION%\n{version}-{release}\n\n"
                     f"%DESC%\nTest package\n\n%ARCH%\n{architecture}\n\n"
                     f"%FILENAME%\n{name}\n\n%CSIZE%\n{len(body)}\n\n"
+                    f"%MD5SUM%\n{hashlib.md5(body).hexdigest()}\n\n"
                     f"%SHA256SUM%\n{hashlib.sha256(body).hexdigest()}\n\n"
                     f"%PGPSIG%\n{base64.b64encode(signature).decode()}\n\n").encode()
             record_name = record_names[index] if record_names else f"{package_name}-{version}-{release}"
@@ -368,7 +369,8 @@ class MirrorTest(unittest.TestCase):
     def test_insufficient_space_fails_before_downloads(self):
         args = SimpleNamespace(stage=self.stage, upstream=self.upstream,
                                arch=["aarch64"], repos=["core"], dry_run=False,
-                               timeout=2, retries=1, workers=1, recover_null_records=False, allow_files_only=[])
+                               timeout=2, retries=1, workers=1, recover_null_records=False, allow_files_only=[],
+                               bucket_listing=None)
         with patch("shutil.disk_usage", return_value=SimpleNamespace(free=1)):
             with redirect_stderr(io.StringIO()):
                 with self.assertRaisesRegex(API["SyncError"], "Insufficient disk space"):
@@ -498,6 +500,67 @@ class MirrorTest(unittest.TestCase):
                                success=False)
         self.assertIn("is not an allowed one", result.stderr)
         self.run_sync("--recover-null-records", "--allow-null-record", f"aarch64/core/{record_name}/desc", code=3)
+
+    def listing(self, objects):
+        """A bucket listing in `rclone lsjson -R --hash` form, for {key: bytes}."""
+        path = Path(self.temporary.name) / "listing.json"
+        path.write_text(json.dumps([{"Path": key, "Size": len(body), "Hashes": {"md5": hashlib.md5(body).hexdigest()}}
+                                    for key, body in objects.items()]))
+        return str(path)
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_bucket_listing_stages_only_what_the_bucket_lacks(self):
+        old = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "builder@test")
+        new = self.signed("other-1-1-aarch64.pkg.tar.xz", b"second package", "builder@test")
+        keyring = str(Path(self.temporary.name) / "builder.gpg")
+        self.publish([old, new])
+        bucket = {"aarch64/core/" + old[0]: old[1], "aarch64/core/" + old[0] + ".sig": old[2],
+                  "aarch64/core/gone-1-1-aarch64.pkg.tar.xz": b"dropped upstream",
+                  "aarch64/core/gone-1-1-aarch64.pkg.tar.xz.sig": b"sig",
+                  "aarch64/extra/keep-1-1-aarch64.pkg.tar.xz": b"another repository",
+                  "aarch64/core/notes.txt": b"not ours"}
+        result = self.run_sync("--keyring", keyring, "--prune", "--bucket-listing", self.listing(bucket), "--json")
+        report = json.loads(result.stdout)
+        repo = self.stage / "aarch64/core"
+        # Only the package the bucket lacks was downloaded and staged.
+        self.assertEqual(report["downloads"], 1)
+        self.assertTrue(report["bucket_listing"])
+        self.assertEqual(self.requests[PREFIX + old[0]], 0)
+        self.assertFalse((repo / old[0]).exists())
+        self.assertFalse((repo / (old[0] + ".sig")).exists())
+        self.assertEqual((repo / new[0]).read_bytes(), new[1])
+        self.assertEqual((repo / (new[0] + ".sig")).read_bytes(), new[2])
+        self.assertTrue((repo / "core.db").is_file())
+        # Deletions are limited to package names in the selected repository.
+        obsolete = self.stage.with_name(self.stage.name + ".obsolete").read_text().split()
+        self.assertEqual(obsolete, ["aarch64/core/gone-1-1-aarch64.pkg.tar.xz",
+                                    "aarch64/core/gone-1-1-aarch64.pkg.tar.xz.sig"])
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_bucket_listing_replaces_an_object_with_other_bytes_under_the_same_name(self):
+        package = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "builder@test")
+        keyring = str(Path(self.temporary.name) / "builder.gpg")
+        self.publish([package])
+        same_size = b"FIRST PACKAGE"
+        self.assertEqual(len(same_size), len(package[1]))
+        result = self.run_sync("--keyring", keyring, "--json", "--bucket-listing",
+                               self.listing({"aarch64/core/" + package[0]: same_size}))
+        self.assertEqual(json.loads(result.stdout)["downloads"], 1)
+        self.assertEqual((self.stage / "aarch64/core" / package[0]).read_bytes(), package[1])
+
+    def test_bucket_listing_needs_a_keyring(self):
+        result = self.run_sync("--bucket-listing", self.listing({}), code=2)
+        self.assertIn("needs --keyring", result.stderr)
+
+    @unittest.skipUnless(shutil.which("gpg") and shutil.which("gpgv"), "needs gpg and gpgv")
+    def test_bucket_listing_still_rejects_an_unsigned_new_package(self):
+        bad = self.signed("demo-1-1-aarch64.pkg.tar.xz", b"first package", "stranger@test")
+        self.signed("x-1-1-aarch64.pkg.tar.xz", b"x", "builder@test")
+        self.publish([bad])
+        result = self.run_sync("--keyring", str(Path(self.temporary.name) / "builder.gpg"),
+                               "--bucket-listing", self.listing({}), success=False)
+        self.assertIn("Signature does not verify", result.stderr)
+        self.assertFalse((self.stage / "aarch64/core/core.db").exists())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# Write the gpgv keyring that every Arch Linux ARM package is checked against.
+# Arch Linux ARM signs every package with one build key and does not sign its
+# databases, so the key is pinned here by fingerprint.
+#
+#   omarchy-mirror-arm-keyring /etc/omarchy-mirror/alarm-build.gpg
+
+set -euo pipefail
+
+OUT="${1:?Usage: $0 FILE}"
+fpr=68B3537F39A313B3E574D06777193F152BDBE6A6
+
+GNUPGHOME="$(mktemp -d)"
+export GNUPGHOME
+trap 'rm -rf "$GNUPGHOME"' EXIT
+
+curl -sSfL -o "$GNUPGHOME/archlinuxarm.gpg" \
+  https://raw.githubusercontent.com/archlinuxarm/PKGBUILDs/master/core/archlinuxarm-keyring/archlinuxarm.gpg
+gpg --quiet --import "$GNUPGHOME/archlinuxarm.gpg"
+gpg --list-keys --with-colons "$fpr" | grep -q "^fpr:.*$fpr"
+gpg --export "$fpr" >"$OUT"

@@ -86,6 +86,14 @@ Two options on the stager make it fit for unattended use:
 
 `omarchy-mirror-upload-arm` uploads packages and signatures first, then the databases, then prunes what the stage no longer holds. It holds the stage lock throughout and refuses a stage whose last run was not `complete`, did not check signatures, or did not cover every repository in the tree. Databases are compared by checksum. Packages from the local stage are compared by time against the time R2 received its copy, which costs nothing beyond the listing; that would miss a same-name replacement stamped older than its upload, so keep the clock synced and do not restore a stage with its old timestamps. Packages above 200 MiB go up in parts with their MD5 stored on the object, so files above R2's 5 GiB single-request limit work and a promote can compare them.
 
+#### Without a local copy
+
+`omarchy-mirror-sync-arm --stateless` keeps nothing between runs. It lists the bucket (26,738 objects with checksums in 23 seconds), and a package the bucket already holds with the database's size and MD5 is neither downloaded nor stored; only new packages pass through the machine, each checked against the database's SHA-256 and the pinned key before it is uploaded. Against the full edge bucket a run with nothing new takes about 35 seconds, and a new machine needs no 52 GiB seed.
+
+The trade: the staged way re-reads every byte every hour, and this way trusts the checksum R2 recorded when each object was uploaded. MD5 only decides what to skip; it never admits a package.
+
+`.github/workflows/arm-sync.yml` runs this hourly on a GitHub runner, so no machine of ours is involved. It is off until the repository variable `ARM_SYNC_IN_ACTIONS` is `true`, and needs an `arm-mirror` environment with the variable `R2_ENDPOINT` and the secrets `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`. Turn the machine's timer off before turning this on.
+
 rc and stable are never synced from upstream. `omarchy-mirror-promote-arm` copies one bucket onto another, server-side and by checksum. It refuses an empty source and copies again if the source's databases changed while it ran. A first full copy is about 27,000 objects and takes a few minutes; later ones copy only what changed. Nothing runs it on a schedule:
 
 ```sh

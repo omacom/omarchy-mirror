@@ -7,6 +7,7 @@
 set -euo pipefail
 
 VERBOSE_RCLONE=""
+DELTA=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -18,13 +19,19 @@ while [[ $# -gt 0 ]]; do
     R2="$2"
     shift 2
     ;;
+  --delta)
+    # The stage holds only what the bucket lacks (omarchy-mirror-stage-arm
+    # --bucket-listing). Nothing is deleted for being absent from it.
+    DELTA=true
+    shift
+    ;;
   --verbose)
     VERBOSE_RCLONE="-v"
     shift
     ;;
   *)
     echo "Unknown option: $1"
-    echo "Usage: $0 --stage STAGE --r2 R2 [--verbose]"
+    echo "Usage: $0 --stage STAGE --r2 R2 [--delta] [--verbose]"
     exit 1
     ;;
   esac
@@ -45,7 +52,7 @@ if [[ $STAGE != *:* ]]; then
   fi
 
   status="$STAGE.status.json"
-  if ! problem=$(python3 - "$status" "$STAGE" 2>&1 <<'PY'
+  if ! problem=$(python3 - "$status" "$STAGE" "$DELTA" 2>&1 <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -57,6 +64,11 @@ if report.get("status") != "complete":
     sys.exit(f"last stage run is '{report.get('status')}'")
 if report.get("signatures_verified") is not True:
     sys.exit("last stage run did not check signatures (--keyring)")
+# A stage made from a bucket listing holds only new packages. Uploading it the
+# ordinary way would delete everything else from the bucket.
+if bool(report.get("bucket_listing")) != bool(sys.argv[3]):
+    sys.exit("last stage run was made from a bucket listing; upload it with --delta" if report.get("bucket_listing")
+             else "last stage run was not made from a bucket listing; --delta does not apply")
 staged = {f"{arch.name}/{repo.name}" for arch in Path(sys.argv[2]).iterdir() if arch.is_dir()
           for repo in arch.iterdir() if repo.is_dir()}
 skipped = sorted(staged - set(report.get("selected_repositories", [])))
@@ -88,7 +100,7 @@ NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --ex
 # would miss a same-name replacement stamped older than its upload, so keep
 # the clock synced and do not restore a stage with its old timestamps.
 INDEX_CHANGED=(--checksum)
-if [[ $STAGE == *:* ]]; then
+if [[ $STAGE == *:* || -n $DELTA ]]; then
   PACKAGE_CHANGED=(--checksum)
   # A copy inside R2 moves no data through this machine, only one request per
   # object, so more of them can be in flight: 127 objects/s against 80 at 64.
@@ -105,8 +117,18 @@ rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@
 echo "Upload db/files + lastsync from $STAGE to $R2"
 rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${INDEX[@]}"
 
-# 3) Prune what is no longer in the stage (safe after the databases)
-echo "Prune removed files on $R2"
-rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}"
+# 3) Prune (safe after the databases)
+if [[ -n $DELTA ]]; then
+  # The stager listed what the databases no longer name.
+  if [[ -s $STAGE.obsolete ]]; then
+    echo "Prune $(wc -l <"$STAGE.obsolete") removed files on $R2"
+    rclone delete "$R2" --files-from-raw "$STAGE.obsolete" $VERBOSE_RCLONE
+  fi
+  # Everything staged is in the bucket now; keep only the databases.
+  find "$STAGE" -type f \( -name '*.pkg.tar.*' \) -delete
+else
+  echo "Prune removed files on $R2"
+  rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}"
+fi
 
 echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"

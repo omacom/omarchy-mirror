@@ -1,0 +1,62 @@
+name: ARM mirror sync
+
+# Brings the edge ARM bucket up to date with Arch Linux ARM, once an hour,
+# with no machine of our own. The bucket's listing says what it already
+# holds, so a run downloads only new packages, checks each against the
+# database's SHA-256 and the pinned build key, and uploads it.
+#
+# Off until the repository variable ARM_SYNC_IN_ACTIONS is "true", so it never
+# runs beside a machine doing the same job.
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+# One at a time; a run that is due while another is going waits for it.
+concurrency:
+  group: arm-mirror-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync edge
+    if: vars.ARM_SYNC_IN_ACTIONS == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Holds the R2 key, and only jobs on master may use it.
+    environment: arm-mirror
+    permissions:
+      contents: read
+    env:
+      RCLONE_VERSION: 1.75.1
+      RCLONE_SHA256: 09c9f7606ed9e31eecc1eec26a89992cf2931a8d2d1a5f0ae2bb1c11630ffb15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install rclone
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/rclone.deb" "https://downloads.rclone.org/v$RCLONE_VERSION/rclone-v$RCLONE_VERSION-linux-amd64.deb"
+          echo "$RCLONE_SHA256  $RUNNER_TEMP/rclone.deb" | sha256sum --check --strict
+          sudo apt-get install -y "$RUNNER_TEMP/rclone.deb"
+
+      - name: Pinned Arch Linux ARM build key
+        run: bin/omarchy-mirror-arm-keyring "$RUNNER_TEMP/alarm-build.gpg"
+
+      - name: Sync
+        env:
+          RCLONE_CONFIG: /dev/null
+          RCLONE_CONFIG_OMARCHY_TYPE: s3
+          RCLONE_CONFIG_OMARCHY_PROVIDER: Cloudflare
+          RCLONE_CONFIG_OMARCHY_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_OMARCHY_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+          RCLONE_CONFIG_OMARCHY_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_OMARCHY_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          bin/omarchy-mirror-sync-arm --stateless \
+            --stage "$RUNNER_TEMP/arm" --r2 omarchy:omarchy-mirror-arm \
+            --keyring "$RUNNER_TEMP/alarm-build.gpg"
