@@ -1,0 +1,175 @@
+#!/bin/bash
+# Bring one package from a newer stage into a frozen snapshot, for a security
+# fix that can't wait for the next release: the edge stage's
+# ca-certificates-mozilla into rc, say, and then rc to stable with
+# omarchy-mirror-sync-stable-from-rc as on release day.
+#
+# Everything else in the target stays as it is. Its database entries for the
+# package are swapped for the source's, which are Arch's own, so pacman checks
+# the package against the same checksum and packager signature as upstream. The
+# old package stays in the stage for machines that still hold the old database.
+# lastsync is unchanged, since the snapshot is the same apart from this. Each
+# backport is recorded in the stage's backports file, and the next snapshot
+# from upstream replaces both.
+#
+# It replaces only a package the target already serves, never adds one, and
+# takes it only from a newer snapshot than the target's.
+set -euo pipefail
+
+usage="Usage: $0 --from STAGE --to STAGE --repo REPO --package NAME --r2 R2"
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --from)
+    FROM="${2%/}/"
+    shift 2
+    ;;
+  --to)
+    TO="${2%/}/"
+    shift 2
+    ;;
+  --repo)
+    REPO="$2"
+    shift 2
+    ;;
+  --package)
+    PACKAGE="$2"
+    shift 2
+    ;;
+  --r2)
+    R2="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown option: $1"
+    echo "$usage"
+    exit 1
+    ;;
+  esac
+done
+if [[ -z ${FROM:-} || -z ${TO:-} || -z ${REPO:-} || -z ${PACKAGE:-} || -z ${R2:-} ]]; then
+  echo "$usage"
+  exit 1
+fi
+
+SRC="${FROM}$REPO/os/x86_64"
+DST="${TO}$REPO/os/x86_64"
+
+# The snapshot a stage holds: its lastsync stamp.
+snapshot() {
+  local stamp
+  stamp=$(cat "$1/lastsync" 2>/dev/null) || return 1
+  [[ $stamp =~ ^[0-9]+$ ]] && echo "$stamp"
+}
+
+# The database entry for the package: its name-version-release directory.
+entry() {
+  tar -tzf "$1" | sed -n "s|^\(${PACKAGE//./\\.}-[^-/]*-[^-/]*\)/desc$|\1|p"
+}
+
+# One field of an entry's desc.
+field() {
+  tar -xzOf "$1" "$2/desc" | sed -n "/^%$3%\$/{n;p;q}"
+}
+
+for stage in "$FROM" "$TO"; do
+  if [[ ! -s ${stage}$REPO/os/x86_64/$REPO.db || ! -s ${stage}$REPO/os/x86_64/$REPO.files ]]; then
+    echo "$stage has no $REPO database, so nothing is backported" >&2
+    exit 1
+  fi
+done
+if ! from_sync=$(snapshot "$FROM") || ! to_sync=$(snapshot "$TO"); then
+  echo "$FROM or $TO has no readable lastsync to compare, so nothing is backported" >&2
+  exit 1
+fi
+if ((from_sync <= to_sync)); then
+  echo "$FROM ($from_sync) is not a newer snapshot than $TO ($to_sync), so nothing is backported" >&2
+  exit 1
+fi
+
+new=$(entry "$SRC/$REPO.db")
+old=$(entry "$DST/$REPO.db")
+if [[ -z $new ]]; then
+  echo "$FROM has no $PACKAGE in $REPO" >&2
+  exit 1
+fi
+if [[ -z $old ]]; then
+  echo "$TO serves no $PACKAGE in $REPO; a backport replaces a package, it never adds one" >&2
+  exit 1
+fi
+
+file=$(field "$SRC/$REPO.db" "$new" FILENAME)
+sha=$(field "$SRC/$REPO.db" "$new" SHA256SUM)
+if [[ -z $file || $file == */* || -z $sha ]]; then
+  echo "$new has no usable filename or checksum in $FROM's database" >&2
+  exit 1
+fi
+
+work=$(mktemp -d "${TO%/}.backport.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+# Copy the package first and check it against the database it comes from: the
+# hourly sync may have replaced it since.
+cp "$SRC/$file" "$SRC/$file.sig" "$work/"
+if ! echo "$sha  $work/$file" | sha256sum -c --status; then
+  echo "$SRC/$file does not match its checksum in $FROM's database" >&2
+  exit 1
+fi
+
+# Each database is rebuilt from the one it replaces, and only while it still
+# names another version, so a run that stopped halfway is finished by the next
+# and one that finished leaves the bytes alone: rc and stable must stay
+# byte-identical.
+changed=""
+replaced=$old
+for kind in db files; do
+  current=$(entry "$DST/$REPO.$kind")
+  [[ $current == "$new" ]] && continue
+  if [[ -z $current ]]; then
+    echo "$TO's $REPO.$kind names no $PACKAGE, though its $REPO.db does" >&2
+    exit 1
+  fi
+  mkdir "$work/$kind"
+  tar -xzf "$DST/$REPO.$kind" -C "$work/$kind"
+  replaced=$current
+  rm -r "${work:?}/$kind/$current"
+  tar -xzf "$SRC/$REPO.$kind" -C "$work/$kind" "$new"
+  (cd "$work/$kind" && tar --owner=0 --group=0 --numeric-owner -czf "$work/$REPO.$kind" -- *)
+  if [[ $(entry "$work/$REPO.$kind") != "$new" ]] || tar -tzf "$work/$REPO.$kind" | grep -q "^$current/"; then
+    echo "the new $REPO.$kind does not hold exactly $new in place of $current" >&2
+    exit 1
+  fi
+  changed=1
+done
+
+# The package before the databases that name it, unless the stage already has
+# it intact.
+for name in "$file" "$file.sig"; do
+  cmp -s "$work/$name" "$DST/$name" && continue
+  cp "$work/$name" "$DST/.$name.new"
+  mv "$DST/.$name.new" "$DST/$name"
+done
+# Both names of each database: rsync --copy-links stages the .tar.gz aliases
+# as files of their own.
+for kind in db files; do
+  if [[ -e $work/$REPO.$kind ]]; then
+    cp "$work/$REPO.$kind" "$DST/.$REPO.$kind.new"
+    mv "$DST/.$REPO.$kind.new" "$DST/$REPO.$kind"
+  fi
+  alias="$DST/$REPO.$kind.tar.gz"
+  if [[ -e $alias ]] && ! cmp -s "$DST/$REPO.$kind" "$alias"; then
+    cp "$DST/$REPO.$kind" "$DST/.$REPO.$kind.tar.gz.new"
+    mv "$DST/.$REPO.$kind.tar.gz.new" "$alias"
+    changed=1
+  fi
+done
+if [[ -n $changed ]]; then
+  grep -qsF " -> $new " "${TO}backports" ||
+    echo "$(date -u +%FT%TZ) $REPO $replaced -> $new from snapshot $from_sync" >>"${TO}backports"
+  echo "$TO now serves $new in place of $replaced"
+else
+  # Run again after a failed upload, it only finishes the upload.
+  echo "$TO already serves $new"
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+"$SCRIPT_DIR/omarchy-mirror-upload" --stage "$TO" --r2 "$R2"
