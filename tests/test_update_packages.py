@@ -1,5 +1,6 @@
 import base64
 import functools
+import gzip
 import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -127,9 +128,16 @@ class UpdatePackagesTest(unittest.TestCase):
         return result, json.loads((work / "plan.json").read_text())
 
     def test_only_selected_records_and_files_change_in_both_channels(self):
-        original = tree(self.root / "stable")
-        previous = API["database"]((self.root / "stable/core/os/x86_64/core.db").read_bytes())
-        previous_files = members(self.root / "stable/core/os/x86_64/core.files")
+        # Identical records can have different archive timestamps per channel.
+        repo = self.root / "rc/extra/os/x86_64"
+        data = gzip.compress(gzip.decompress((repo / "extra.db").read_bytes()), mtime=1)
+        for alias in ("extra.db", "extra.db.tar.gz"):
+            (repo / alias).write_bytes(data)
+        original = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
+        previous = {channel: API["database"](files["core/os/x86_64/core.db"])
+                    for channel, files in original.items()}
+        previous_files = {channel: members(self.root / channel / "core/os/x86_64/core.files")
+                          for channel in original}
         result, plan = self.update(packages=("demo=2-1",))
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -139,9 +147,9 @@ class UpdatePackagesTest(unittest.TestCase):
             current = API["database"]((folder / "core/os/x86_64/core.db").read_bytes())
             self.assertEqual(current["demo"]["%VERSION%"], ["2-1"])
             for name in ("helper", "unchanged"):
-                self.assertEqual(current[name], previous[name])
+                self.assertEqual(current[name], previous[channel][name])
             current_files = members(folder / "core/os/x86_64/core.files")
-            for name, data in previous_files.items():
+            for name, data in previous_files[channel].items():
                 if not name.startswith("demo-"):
                     self.assertEqual(current_files[name], data)
             self.assertEqual((folder / "lastsync").read_text(), "42\n")
@@ -150,9 +158,9 @@ class UpdatePackagesTest(unittest.TestCase):
             self.assertEqual((folder / "core/os/x86_64/demo-2-1-x86_64.pkg.tar.xz.sig").read_bytes(),
                              self.package("demo", "2-1").with_name("demo-2-1-x86_64.pkg.tar.xz.sig").read_bytes())
             current_tree = tree(folder)
-            for name, data in original.items():
+            for name, data in original[channel].items():
                 if not name.startswith("core/os/x86_64/core."):
-                    self.assertEqual(current_tree[name], data)
+                    self.assertEqual(current_tree[name], data, f"{channel}/{name}")
 
     def test_read_only_plan_changes_neither_channel(self):
         before = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
