@@ -12,10 +12,6 @@ on:
         type: choice
         options: [x86_64, aarch64]
         default: x86_64
-      promote_stable:
-        description: "Promote the same updates to stable after verifying rc"
-        type: boolean
-        default: true
       apply:
         description: "Publish updates (unchecked prepares a read-only plan)"
         type: boolean
@@ -59,7 +55,6 @@ jobs:
         env:
           PACKAGES: ${{ inputs.packages }}
           ARCHITECTURE: ${{ inputs.architecture }}
-          PROMOTE_STABLE: ${{ inputs.promote_stable }}
           APPLY: ${{ inputs.apply }}
           RCLONE_CONFIG_OMARCHY_TYPE: s3
           RCLONE_CONFIG_OMARCHY_PROVIDER: Cloudflare
@@ -72,9 +67,6 @@ jobs:
           set -euo pipefail
           read -r -a packages <<< "$PACKAGES"
           args=(--architecture "$ARCHITECTURE" --work mirror-update)
-          if [[ $PROMOTE_STABLE == "true" ]]; then
-            args+=(--promote-stable)
-          fi
           if [[ $APPLY == "true" ]]; then
             args+=(--apply)
           fi

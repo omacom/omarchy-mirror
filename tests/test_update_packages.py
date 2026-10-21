@@ -42,7 +42,13 @@ class UpdatePackagesTest(unittest.TestCase):
         cls.gnupg = cls.shared / "gnupg"
         cls.gnupg.mkdir(mode=0o700)
         command(["gpg", "--homedir", cls.gnupg, "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
-                 "--quick-generate-key", "Mirror test <mirror@example.invalid>", "ed25519", "sign", "0"])
+                 "--quick-generate-key", "Mirror test <mirror@example.invalid>", "ed25519", "cert", "0"])
+        listing = command(["gpg", "--homedir", cls.gnupg, "--with-colons", "--list-keys"]).stdout.decode()
+        cls.primary = next(line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:"))
+        command(["gpg", "--homedir", cls.gnupg, "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
+                 "--quick-add-key", cls.primary, "ed25519", "sign", "0"])
+        listing = command(["gpg", "--homedir", cls.gnupg, "--with-colons", "--list-keys"]).stdout.decode()
+        cls.subkey = [line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")][-1]
         cls.keyring = cls.shared / "keyring.gpg"
         cls.keyring.write_bytes(command(["gpg", "--homedir", cls.gnupg, "--export"]).stdout)
 
@@ -52,8 +58,8 @@ class UpdatePackagesTest(unittest.TestCase):
         shutil.rmtree(cls.shared)
 
     @classmethod
-    def package(cls, name, version, dependencies=(), architecture="x86_64"):
-        key = hashlib.sha256(repr((name, version, dependencies, architecture)).encode()).hexdigest()
+    def package(cls, name, version, dependencies=(), architecture="x86_64", provides=()):
+        key = hashlib.sha256(repr((name, version, dependencies, architecture, provides)).encode()).hexdigest()
         folder = cls.shared / key
         folder.mkdir(exist_ok=True)
         filename = folder / f"{name}-{version}-{architecture}.pkg.tar.xz"
@@ -62,6 +68,7 @@ class UpdatePackagesTest(unittest.TestCase):
                        f"url = https://example.invalid\nbuilddate = 1\npackager = Test\nsize = 1\n"
                        f"arch = {architecture}\nlicense = MIT\n")
             pkginfo += "".join(f"depend = {dependency}\n" for dependency in dependencies)
+            pkginfo += "".join(f"provides = {value}\n" for value in provides)
             with tarfile.open(filename, "w:xz") as archive:
                 for member_name, data in ((".PKGINFO", pkginfo.encode()), (f"usr/share/{name}/value", version.encode())):
                     member = tarfile.TarInfo(member_name)
@@ -111,7 +118,7 @@ class UpdatePackagesTest(unittest.TestCase):
             alias.unlink()
             alias.write_bytes(data)
 
-    def update(self, packages=("demo",), apply=True, stable=True, architecture="x86_64", prefix=""):
+    def update(self, packages=("demo",), apply=True, architecture="x86_64", prefix=""):
         self.run_number += 1
         work = self.root / f"work-{self.run_number}"
         base = self.url + ("/" + prefix if prefix else "")
@@ -122,10 +129,19 @@ class UpdatePackagesTest(unittest.TestCase):
                 "--rc-remote", f"omarchy:{destination}/rc", "--stable-remote", f"omarchy:{destination}/stable"]
         if apply:
             args.append("--apply")
-        if stable:
-            args.append("--promote-stable")
         result = subprocess.run([str(arg) for arg in [*args, "--", *packages]], capture_output=True, text=True, env=self.env)
         return result, json.loads((work / "plan.json").read_text())
+
+    def fail_upload(self, relative):
+        wrappers = self.root / "bin"
+        wrappers.mkdir()
+        remote = f"omarchy:{self.root}/{relative}"
+        wrapper = wrappers / "rclone"
+        wrapper.write_text('#!/bin/bash\nset -euo pipefail\n'
+                           f'if [[ $1 == "copyto" && $3 == "{remote}" ]]; then exit 1; fi\n'
+                           f'"{shutil.which("rclone")}" "$@"\n')
+        wrapper.chmod(0o755)
+        self.env["PATH"] = f"{wrappers}:{os.environ['PATH']}"
 
     def test_only_selected_records_and_files_change_in_both_channels(self):
         # Identical records can have different archive timestamps per channel.
@@ -169,13 +185,6 @@ class UpdatePackagesTest(unittest.TestCase):
         self.assertEqual(plan["published"], [])
         self.assertEqual(before, {channel: tree(self.root / channel) for channel in ("rc", "stable")})
 
-    def test_rc_only_does_not_touch_stable(self):
-        before = tree(self.root / "stable")
-        result, plan = self.update(stable=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(plan["published"], ["rc"])
-        self.assertEqual(tree(self.root / "stable"), before)
-
     def test_arm_layout_uses_the_same_selected_package_flow(self):
         for channel in ("source", "rc", "stable"):
             for repo in ("core", "extra", "alarm", "aur"):
@@ -197,8 +206,14 @@ class UpdatePackagesTest(unittest.TestCase):
         before = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
         result, plan = self.update()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(all(not item["updates"] for item in plan["channels"]))
-        self.assertEqual(before, {channel: tree(self.root / channel) for channel in ("rc", "stable")})
+        self.assertEqual(plan["published"], ["rc", "stable"])
+        for channel, original in before.items():
+            current = tree(self.root / channel)
+            for name, data in original.items():
+                if name in {f"core/os/x86_64/core.{suffix}" for suffix in ("db", "db.tar.gz", "files", "files.tar.gz")}:
+                    self.assertEqual(API["database"](data), API["database"](current[name]))
+                else:
+                    self.assertEqual(current[name], data, f"{channel}/{name}")
 
     def test_missing_selected_dependency_stops_before_any_publication(self):
         needs_helper = self.package("demo", "2-1", ("helper>=2",))
@@ -209,6 +224,30 @@ class UpdatePackagesTest(unittest.TestCase):
         self.assertIn("pacman failed", result.stderr)
         self.assertEqual(plan["published"], [])
         self.assertEqual(before, {channel: tree(self.root / channel) for channel in ("rc", "stable")})
+
+    def test_broken_frozen_consumers_stop_before_any_publication(self):
+        old = self.package("demo", "1-1", provides=("libdemo.so=1-64",))
+        new = self.package("demo", "2-1", provides=("libdemo.so=2-64",))
+        self.repository(self.root / "source/core/os/x86_64", "core", [new])
+        for dependency in ("demo=1", "libdemo.so=1-64"):
+            with self.subTest(dependency=dependency):
+                consumer = self.package("consumer", "1-1", (dependency,))
+                for channel in ("rc", "stable"):
+                    self.repository(self.root / channel / "core/os/x86_64", "core", [old, consumer])
+                before = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
+                result, plan = self.update()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("pacman failed", result.stderr)
+                self.assertEqual(plan["published"], [])
+                self.assertEqual(before, {channel: tree(self.root / channel) for channel in ("rc", "stable")})
+
+    def test_consumer_can_be_updated_explicitly_with_its_library(self):
+        for channel in ("rc", "stable"):
+            self.repository(self.root / channel / "core/os/x86_64", "core", [self.package("consumer", "1-1", ("demo=1",))])
+        self.repository(self.root / "source/core/os/x86_64", "core", [self.package("consumer", "2-1", ("demo=2",))])
+        result, plan = self.update(packages=("demo", "consumer"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plan["published"], ["rc", "stable"])
 
     def test_explicitly_selected_dependency_can_be_updated_together(self):
         self.repository(self.root / "source/core/os/x86_64", "core", [self.package("demo", "2-1", ("helper>=2",))])
@@ -290,6 +329,76 @@ class UpdatePackagesTest(unittest.TestCase):
         self.assertIn("gpgv failed", result.stderr)
         self.assertEqual(plan["published"], [])
 
+    def test_distribution_disabled_signer_or_primary_is_rejected(self):
+        policy = self.keyring.with_name("keyring-revoked")
+        self.addCleanup(policy.unlink)
+        for fingerprint in (self.primary, self.subkey):
+            with self.subTest(fingerprint=fingerprint):
+                policy.write_text(fingerprint.lower() + "\n")
+                before = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
+                result, plan = self.update()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Distribution has disabled the signing key", result.stderr)
+                self.assertEqual(plan["published"], [])
+                self.assertEqual(before, {channel: tree(self.root / channel) for channel in ("rc", "stable")})
+
+    def test_both_floors_must_be_protected_before_either_channel_changes(self):
+        before = {channel: tree(self.root / channel) for channel in ("rc", "stable")}
+        self.fail_upload("stable/package-update-floor.json")
+        result, plan = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(plan["published"], [])
+        for channel, original in before.items():
+            current = tree(self.root / channel)
+            current.pop("package-update-floor.json", None)
+            self.assertEqual(current, original)
+        self.env["PATH"] = os.environ["PATH"]
+        result, plan = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plan["published"], ["rc", "stable"])
+
+    def test_partial_metadata_is_repaired_and_stale_promotion_is_blocked(self):
+        local_rc, local_stable = self.root / "local-rc", self.root / "local-stable"
+        shutil.copytree(self.root / "rc", local_rc)
+        shutil.copytree(self.root / "stable", local_stable)
+        self.fail_upload("rc/core/os/x86_64/core.db.tar.gz")
+        result, plan = self.update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(plan["published"], [])
+        for channel in ("rc", "stable"):
+            self.assertTrue((self.root / channel / "package-update-floor.json").exists())
+        repo = self.root / "rc/core/os/x86_64"
+        self.assertEqual(API["database"]((repo / "core.db").read_bytes())["demo"]["%VERSION%"], ["1-1"])
+        self.assertEqual(API["database"]((repo / "core.files").read_bytes())["demo"]["%VERSION%"], ["2-1"])
+        self.env["PATH"] = os.environ["PATH"]
+        promotion = subprocess.run([str(SCRIPT.with_name("omarchy-mirror-copy-stage")), "--from", str(local_rc),
+                                    "--to", str(local_stable), "--r2", f"omarchy:{self.root}/stable"],
+                                   capture_output=True, text=True, env=self.env)
+        self.assertNotEqual(promotion.returncode, 0)
+        self.assertIn("older than targeted package updates", promotion.stderr)
+        result, plan = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plan["published"], ["rc", "stable"])
+        for channel in ("rc", "stable"):
+            repo = self.root / channel / "core/os/x86_64"
+            for kind in ("db", "files"):
+                self.assertEqual((repo / f"core.{kind}").read_bytes(), (repo / f"core.{kind}.tar.gz").read_bytes())
+
+    def test_equal_versions_repair_missing_floor_and_metadata_aliases(self):
+        result, _ = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.root / "rc/package-update-floor.json").unlink()
+        for suffix in ("files", "db.tar.gz", "files.tar.gz"):
+            shutil.copyfile(self.root / "work-1/rc" / f"core.{suffix.split('.')[0]}.tar.gz.old",
+                            self.root / "rc/core/os/x86_64" / f"core.{suffix}")
+        result, plan = self.update()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(plan["published"], ["rc", "stable"])
+        self.assertTrue((self.root / "rc/package-update-floor.json").exists())
+        repo = self.root / "rc/core/os/x86_64"
+        for suffix in ("db", "files", "db.tar.gz", "files.tar.gz"):
+            self.assertEqual(API["database"]((repo / f"core.{suffix}").read_bytes())["demo"]["%VERSION%"], ["2-1"])
+
     def test_failed_rc_readback_prevents_stable_publication(self):
         wrappers = self.root / "bin"
         wrappers.mkdir()
@@ -310,7 +419,10 @@ class UpdatePackagesTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Published database verification failed: rc", result.stderr)
         self.assertEqual(plan["published"], [])
-        self.assertEqual(tree(self.root / "stable"), before)
+        after = tree(self.root / "stable")
+        self.assertIn("package-update-floor.json", after)
+        del after["package-update-floor.json"]
+        self.assertEqual(after, before)
 
     def test_intervening_metadata_change_is_not_overwritten(self):
         wrappers = self.root / "bin"
@@ -332,7 +444,10 @@ class UpdatePackagesTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("changed during preparation", result.stderr)
         self.assertEqual(database_file.read_bytes(), original + b"changed")
-        self.assertEqual(tree(self.root / "stable"), stable)
+        after = tree(self.root / "stable")
+        self.assertIn("package-update-floor.json", after)
+        del after["package-update-floor.json"]
+        self.assertEqual(after, stable)
         self.assertEqual(plan["published"], [])
 
 

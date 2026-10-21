@@ -88,6 +88,22 @@ def one(record, key):
     return values[0]
 
 
+def prepare_files(data, selected, destination):
+    # repo-add removes entries using the .db version. A partial upload may
+    # leave another selected version in .files, so remove those entries first.
+    with tarfile.open(fileobj=io.BytesIO(data)) as source:
+        excluded = set()
+        for member in source:
+            if member.isfile() and member.name.endswith("/desc"):
+                name = re.search(r"(?:^|\n)%NAME%\n([^\n]+)", source.extractfile(member).read().decode())[1]
+                if name in selected:
+                    excluded.add(Path(member.name).parts[0])
+        with tarfile.open(destination, "w:gz") as output:
+            for member in source.getmembers():
+                if Path(member.name).parts[0] not in excluded:
+                    output.addfile(member, source.extractfile(member) if member.isfile() else None)
+
+
 def repository_path(arch, repo):
     return f"{repo}/os/{arch}" if arch == "x86_64" else f"{arch}/{repo}"
 
@@ -106,10 +122,11 @@ def prepare_keyring(source, work):
     else:
         shutil.copyfile(source, destination)
     (work / "gnupg").mkdir(mode=0o700)
-    return destination
+    revoked = source.with_name(source.stem + "-revoked")
+    return destination, set(revoked.read_text().upper().split()) if revoked.exists() else set()
 
 
-def download_package(upstream, arch, repo, record, work, keyring):
+def download_package(upstream, arch, repo, record, work, keyring, revoked):
     name, version = one(record, "NAME"), one(record, "VERSION")
     filename = one(record, "FILENAME")
     if Path(filename).name != filename or filename in (".", ".."):
@@ -141,7 +158,10 @@ def download_package(upstream, arch, repo, record, work, keyring):
     if "[GNUPG:] VALIDSIG " not in status or any(
             f"[GNUPG:] {bad} " in status for bad in ("REVKEYSIG", "EXPKEYSIG", "EXPSIG", "BADSIG")):
         raise ValueError(f"Package signature is not valid: {name}")
-    signer = next(line.split()[2] for line in status.splitlines() if line.startswith("[GNUPG:] VALIDSIG "))
+    valid = next(line.split() for line in status.splitlines() if line.startswith("[GNUPG:] VALIDSIG "))
+    signer, primary = valid[2], valid[-1]
+    if signer in revoked or primary in revoked:
+        raise ValueError(f"Distribution has disabled the signing key for {name}")
     return {"name": name, "version": version, "repo": repo, "record": record, "signer": signer,
             "path": package, "signature": signature_file}
 
@@ -192,26 +212,26 @@ def prepare_channel(args, channel, selected, work):
         comparison = int(run(["vercmp", package["version"], one(current, "VERSION")]).strip())
         if comparison < 0:
             raise ValueError(f"Refusing to downgrade {channel}/{name}")
-        if comparison == 0:
-            if one(current, "SHA256SUM") != one(package["record"], "SHA256SUM"):
-                raise ValueError(f"Same version has different contents: {channel}/{name}")
-        else:
-            updates[repo].append(package)
+        if comparison == 0 and one(current, "SHA256SUM") != one(package["record"], "SHA256SUM"):
+            raise ValueError(f"Same version has different contents: {channel}/{name}")
+        # Reapply equal versions too, repairing aliases after an interrupted run.
+        updates[repo].append(package)
     metadata, staged_records = {}, dict(records)
     for repo, packages in updates.items():
         prefix = repository_path(arch, repo)
         files = remote_bytes(remote, f"{prefix}/{repo}.files") if args.apply else fetch(f"{public}/{prefix}/{repo}.files")
         original_files = database(files)
-        if original_files != records[repo]:
-            raise ValueError(f"{channel}/{repo} databases disagree; retry after its current update")
-        (folder / f"{repo}.files.tar.gz").write_bytes(files)
+        chosen = {package["name"]: package for package in packages}
+        if ({name: record for name, record in original_files.items() if name not in chosen}
+                != {name: record for name, record in records[repo].items() if name not in chosen}):
+            raise ValueError(f"{channel}/{repo} databases disagree on unselected packages")
+        prepare_files(files, chosen, folder / f"{repo}.files.tar.gz")
         run(["repo-add", "--quiet", "--include-sigs", "--prevent-downgrade",
              folder / f"{repo}.db.tar.gz", *[package["path"] for package in packages]])
         updated = database((folder / f"{repo}.db.tar.gz").read_bytes())
         updated_files = database((folder / f"{repo}.files.tar.gz").read_bytes())
         if updated != updated_files or updated.keys() != records[repo].keys() | {package["name"] for package in packages}:
             raise ValueError(f"Unexpected database change in {channel}/{repo}")
-        chosen = {package["name"]: package for package in packages}
         for name, old in records[repo].items():
             if name not in chosen and updated[name] != old:
                 raise ValueError(f"Unselected package changed: {channel}/{name}")
@@ -221,12 +241,10 @@ def prepare_channel(args, channel, selected, work):
                     raise ValueError(f"Updated metadata does not match signed package: {channel}/{name}/{key}")
         metadata[repo] = {"db": originals[repo], "files": files}
         staged_records[repo] = updated
-    next_floor = floor
-    if updates:
-        next_floor = FLOORS["merge_floors"](floor, {
-            "schema": 1, "architecture": arch, "packages": {
-                package["name"]: {"version": package["version"], "sha256": one(package["record"], "SHA256SUM")}
-                for packages in updates.values() for package in packages}})
+    next_floor = FLOORS["merge_floors"](floor, {
+        "schema": 1, "architecture": arch, "packages": {
+            package["name"]: {"version": package["version"], "sha256": one(package["record"], "SHA256SUM")}
+            for package in selected}})
     for name, required in next_floor.get("packages", {}).items():
         matches = [data[name] for data in staged_records.values() if name in data]
         if len(matches) != 1:
@@ -243,30 +261,51 @@ def prepare_channel(args, channel, selected, work):
         config.extend([f"[{repo}]", f"Server = {public}/{repository_path(arch, repo)}"])
     config_file = folder / "pacman.conf"
     config_file.write_text("\n".join(config) + "\n")
-    run(["pacman", "--config", config_file, "--dbpath", dbpath,
-         "--logfile", folder / "pacman.log", "-Sp", "--print-format", "%n %v",
-         *[package["name"] for package in selected]])
+    pacman = ["pacman", "--config", config_file, "--dbpath", dbpath,
+              "--logfile", folder / "pacman.log", "-Sp", "--print-format", "%n %v"]
+    names = {package["name"] for package in selected}
+    run([*pacman, *sorted(names)])
+    affected = set(names)
+    for package in selected:
+        for record in (records[package["repo"]].get(package["name"], {}), package["record"]):
+            affected.update(re.split(r"[<>=]", value, maxsplit=1)[0] for value in record.get("%PROVIDES%", []))
+    for repo in records.values():
+        for name, record in repo.items():
+            if name not in names and any(re.split(r"[<>=]", value, maxsplit=1)[0] in affected
+                                         for value in record.get("%DEPENDS%", [])):
+                run([*pacman, name])
     return {"name": channel, "folder": folder, "remote": remote, "updates": updates,
             "metadata": metadata, "originals": originals, "previous": previous, "floor": floor, "next_floor": next_floor}
 
 
+def unchanged(args, prepared):
+    channel, remote = prepared["name"], prepared["remote"]
+    if FLOORS["read_floor"](remote) != prepared["floor"]:
+        raise ValueError(f"{channel}'s package-update floor changed during preparation")
+    for repo, original in prepared["originals"].items():
+        prefix = repository_path(args.architecture, repo)
+        if remote_bytes(remote, f"{prefix}/{repo}.db") != original:
+            raise ValueError(f"{channel}/{repo} changed during preparation; refusing stale metadata")
+    for repo, original in prepared["metadata"].items():
+        prefix = repository_path(args.architecture, repo)
+        if remote_bytes(remote, f"{prefix}/{repo}.files") != original["files"]:
+            raise ValueError(f"{channel}/{repo}.files changed during preparation")
+
+
+def protect_channel(args, prepared, work):
+    unchanged(args, prepared)
+    marker = work / f"{prepared['name']}-{FLOOR}"
+    marker.write_text(json.dumps(prepared["next_floor"], sort_keys=True) + "\n")
+    run(["rclone", "copyto", marker, f"{prepared['remote']}/{FLOOR}"])
+    if remote_bytes(prepared["remote"], FLOOR) != marker.read_bytes():
+        raise ValueError(f"Package-update floor verification failed: {prepared['name']}")
+    prepared["floor"] = prepared["next_floor"]
+
+
 def publish_channel(args, prepared, work):
     channel, remote = prepared["name"], prepared["remote"]
-    # Uploads are additive: old packages and unrelated metadata are retained.
-    # Check the live origin, bypassing the CDN, before replacing its metadata.
-    def unchanged():
-        if FLOORS["read_floor"](remote) != prepared["floor"]:
-            raise ValueError(f"{channel}'s package-update floor changed during preparation")
-        for repo, original in prepared["originals"].items():
-            prefix = repository_path(args.architecture, repo)
-            if remote_bytes(remote, f"{prefix}/{repo}.db") != original:
-                raise ValueError(f"{channel}/{repo} changed during preparation; refusing stale metadata")
-        for repo, original in prepared["metadata"].items():
-            prefix = repository_path(args.architecture, repo)
-            if remote_bytes(remote, f"{prefix}/{repo}.files") != original["files"]:
-                raise ValueError(f"{channel}/{repo}.files changed during preparation")
-
-    unchanged()
+    # Check the origin, bypassing the CDN. Uploads retain old packages.
+    unchanged(args, prepared)
     for repo, packages in prepared["updates"].items():
         prefix = repository_path(args.architecture, repo)
         for package in packages:
@@ -277,7 +316,7 @@ def publish_channel(args, prepared, work):
                 if file_digest(check) != file_digest(source):
                     raise ValueError(f"Uploaded package/signature verification failed: {source.name}")
                 check.unlink()
-    unchanged()
+    unchanged(args, prepared)
     for repo in prepared["updates"]:
         prefix = repository_path(args.architecture, repo)
         for kind, alias in (("files", "files.tar.gz"), ("files", "files"), ("db", "db.tar.gz"), ("db", "db")):
@@ -290,13 +329,6 @@ def publish_channel(args, prepared, work):
             for alias in (kind, f"{kind}.tar.gz"):
                 if remote_bytes(remote, f"{prefix}/{repo}.{alias}") != expected:
                     raise ValueError(f"Published database verification failed: {channel}/{repo}.{alias}")
-    # Check actual package versions and checksums on later full publications:
-    # a freshly timestamped stage can still have an old upstream package.
-    marker = work / f"{channel}-{FLOOR}"
-    marker.write_text(json.dumps(prepared["next_floor"], sort_keys=True) + "\n")
-    run(["rclone", "copyto", marker, f"{remote}/{FLOOR}"])
-    if remote_bytes(remote, FLOOR) != marker.read_bytes():
-        raise ValueError(f"Published package-update floor verification failed: {channel}")
 
 
 def main():
@@ -306,7 +338,6 @@ def main():
     parser.add_argument("--upstream", help="Source mirror root (defaults to the architecture's edge mirror)")
     parser.add_argument("--keyring", type=Path, help="Trusted distribution public keyring")
     parser.add_argument("--work", type=Path, required=True, help="New, empty directory for packages and the plan")
-    parser.add_argument("--promote-stable", action="store_true", help="Publish the same selected updates to stable after verifying rc")
     parser.add_argument("--apply", action="store_true", help="Publish updates; otherwise prepare and validate a read-only plan")
     for channel in ("rc", "stable"):
         parser.add_argument(f"--{channel}-remote", default=None)
@@ -314,7 +345,6 @@ def main():
     args = parser.parse_args()
     upstream, repos, keyring_name = LAYOUTS[args.architecture]
     args.upstream = (args.upstream or upstream).rstrip("/")
-    args.keyring = args.keyring or Path(f"/usr/share/pacman/keyrings/{keyring_name}.gpg")
     arm = "arm-" if args.architecture == "aarch64" else ""
     suffix = "-arm" if arm else ""
     for channel in ("rc", "stable"):
@@ -326,6 +356,10 @@ def main():
     plan = {"architecture": args.architecture, "source": args.upstream, "apply": args.apply,
             "packages": [], "channels": [], "published": []}
     try:
+        if args.keyring is None:
+            args.keyring = Path(f"/usr/share/pacman/keyrings/{keyring_name}.gpg")
+            if not args.keyring.with_name(keyring_name + "-revoked").is_file():
+                raise ValueError("Distribution's disabled-key list is missing")
         requested = {}
         for specification in args.packages:
             name, separator, version = specification.partition("=")
@@ -343,15 +377,14 @@ def main():
                     source[name] = (repo, record)
         if source.keys() != requested.keys():
             raise ValueError(f"Packages missing from upstream: {', '.join(sorted(requested.keys() - source.keys()))}")
-        keyring = prepare_keyring(args.keyring, args.work)
-        selected = [download_package(args.upstream, args.architecture, *source[name], args.work, keyring) for name in requested]
+        keyring, revoked = prepare_keyring(args.keyring, args.work)
+        selected = [download_package(args.upstream, args.architecture, *source[name], args.work, keyring, revoked) for name in requested]
         for package in selected:
             item = {key: package[key] for key in ("name", "version", "repo", "signer")}
             item["filename"] = package["path"].name
             item["sha256"] = one(package["record"], "SHA256SUM")
             plan["packages"].append(item)
-        channels = [prepare_channel(args, channel, selected, args.work)
-                    for channel in (["rc", "stable"] if args.promote_stable else ["rc"])]
+        channels = [prepare_channel(args, channel, selected, args.work) for channel in ("rc", "stable")]
         for channel in channels:
             plan["channels"].append({"channel": channel["name"], "updates": [
                 {"name": package["name"], "from": channel["previous"][package["name"]], "to": package["version"]}
@@ -360,9 +393,10 @@ def main():
         (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
         print(json.dumps(plan, indent=2), flush=True)
         if args.apply:
+            # Protect BOTH destinations first, including interruptions after rc.
             for channel in channels:
-                if not channel["updates"]:
-                    continue
+                protect_channel(args, channel, args.work)
+            for channel in channels:
                 plan["publishing"] = channel["name"]
                 (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
                 publish_channel(args, channel, args.work)

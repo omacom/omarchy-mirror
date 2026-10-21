@@ -26,16 +26,16 @@ Promote the mirror before the packages. `stable-mirror.omarchy.org/lastsync` mat
 
 ### Targeted package updates
 
-Use **Actions → Update selected mirror packages** for updates between releases. Enter space-separated package names or `name=version` pins and choose the architecture. The job previews changes by default; enable **Publish updates** to update rc and optionally stable. Packages come from the architecture's edge mirror; include any required dependency updates explicitly.
+Use **Actions → Update selected mirror packages** for updates between releases. Enter space-separated package names or `name=version` pins and choose the architecture. The job previews changes by default; enable **Publish updates** to update rc, verify it, then update stable. Packages come from the architecture's edge mirror; include any required dependency updates explicitly.
 
 Before publishing, deploy the updated mirror scripts and configure the `mirror-update` environment with `MIRROR_R2_ACCESS_KEY_ID` and `MIRROR_R2_SECRET_ACCESS_KEY`, scoped to the rc/stable buckets. The setup scripts install `vercmp`. Read-only plans need no credentials.
 
-The job verifies distribution signatures, checksums and dependency resolution. Unrelated packages and `lastsync` stay unchanged, and full snapshot publishers prevent later downgrades of the selected packages. Do not overlap this job with a full mirror publication.
+The job verifies distribution signatures, checksums and declared dependencies, including affected consumers. Application compatibility still needs testing. Unrelated packages and `lastsync` stay unchanged. Both channels are protected against later downgrades before publication starts; rerun a failed job to finish it. Do not overlap this job with a full mirror publication.
 
 To preview locally on Arch:
 
 ```sh
-bin/omarchy-mirror-update-packages --work /tmp/package-update --promote-stable openssl
+bin/omarchy-mirror-update-packages --work /tmp/package-update openssl
 ```
 
 Add `--apply` to publish through the configured `omarchy:` rclone remote. The work directory must be new or empty and retains `plan.json`.
