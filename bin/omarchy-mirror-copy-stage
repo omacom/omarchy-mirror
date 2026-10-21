@@ -66,5 +66,6 @@ if [[ -n $to_sync ]] && ((to_sync > from_sync)); then
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+"$SCRIPT_DIR/omarchy-mirror-update-floor" --stage "$FROM" --r2 "$R2"
 rsync -a --delete "$FROM" "$TO"
 "$SCRIPT_DIR/omarchy-mirror-upload" --stage "$TO" --r2 "$R2"

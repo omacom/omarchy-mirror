@@ -24,6 +24,35 @@ Snapshots only move forward, from upstream to rc to stable, and stable never syn
 
 Promote the mirror before the packages. `stable-mirror.omarchy.org/lastsync` matches `rc-mirror.omarchy.org/lastsync` once the copy is up, and only then should stable packages be promoted. Stable packages built against the new snapshot would otherwise reach machines that still get the old one.
 
+### Emergency package updates
+
+Use **Actions → Update selected mirror packages** for a one-time security update between releases. Enter the exact package names, choose x86_64 or aarch64, and leave **Publish updates** unchecked to review the plan first. **Promote the same updates to stable after verifying rc** publishes to both channels in that order; uncheck it to update rc alone. There is no schedule and the rest of each frozen snapshot stays unchanged.
+
+For the October 2026 eMudhra incident, select these x86_64 packages with exact versions:
+
+```text
+ca-certificates-mozilla=3.131.1-1 nss=3.131.1-1 lib32-nss=3.131.1-1
+```
+
+The source is the architecture's edge mirror. A version pin must match the source; the job does not find older versions in an archive. Select the packages explicitly: dependencies are checked against each destination's frozen repositories, and an update that needs other newer packages stops until those packages are also selected. Maintainers must still assess compatibility with existing applications, especially when selecting libraries. ARM cannot receive a fix until its upstream packages are available.
+
+For publication, configure the `mirror-update` GitHub environment with `MIRROR_R2_ACCESS_KEY_ID` and `MIRROR_R2_SECRET_ACCESS_KEY`, scoped to the architecture's rc and stable mirror buckets. Read-only plans need no R2 credentials. The Actions step summary records the plan, the exact selected versions, and which channels were published.
+
+The job verifies package size, SHA-256 and the original distribution signatures, uses `repo-add --include-sigs` to replace only the selected records in `.db` and `.files`, and resolves their dependencies using real pacman against the destination's package set. Package files and signatures are uploaded and read back before publishing metadata; rc's resulting metadata is verified before stable is touched. Old packages are retained, and `lastsync` is unchanged because this is not a full snapshot refresh. Metadata changes during preparation abort the update. A failed rc publication stops stable; rerunning the job handles already-updated packages without downgrading them.
+
+After verification the job records the selected minimum versions and checksums in `package-update-floor.json`. Full snapshot uploaders preserve these constraints and check actual package records with pacman's `vercmp`, so a later release cannot silently undo the security update, even if its stage has a newer timestamp. A copied channel carries its constraints only after its databases have been published. The file does not change `lastsync` or claim that unrelated packages were updated. Deploy the updated publishing scripts on the mirror hosts before using publication mode; `bin/setup` and `bin/setup-arm` install Ubuntu's `makepkg` package for `vercmp`.
+
+Do not overlap an emergency update with a full snapshot publication on the mirror host. Actions serializes emergency jobs, and origin metadata is checked immediately before publication, but those checks do not provide a cross-host lock. The job refuses signed destination databases instead of dropping their signatures, and refuses packages that moved between repositories; those cases need the regular release path.
+
+The same command can prepare a public, read-only plan locally on Arch with Python, pacman's repository tools and GnuPG installed:
+
+```sh
+bin/omarchy-mirror-update-packages --work /tmp/emudhra-plan --promote-stable \
+  ca-certificates-mozilla=3.131.1-1 nss=3.131.1-1 lib32-nss=3.131.1-1
+```
+
+Add `--apply` to publish using the configured `omarchy:` rclone remote. `--work` must be new or empty; it retains the verified packages, prepared databases and `plan.json`. Applications with their own certificate bundles still need their own security updates.
+
 ## Arch Linux ARM: local HTTP staging
 
 Arch Linux ARM [pushes to its official mirrors](https://archlinuxarm.org/about/mirrors), but their public HTTP repositories can be pulled independently. `bin/omarchy-mirror-stage-arm` stages packages locally using Python 3.9+ and its standard library. It defaults to the [Florida mirror](https://fl.us.mirror.archlinuxarm.org/) over HTTPS. It does not upload to R2, change existing mirror services, or register an official ARM mirror.

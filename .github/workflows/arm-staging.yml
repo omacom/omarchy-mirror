@@ -9,6 +9,8 @@ on:
       - bin/omarchy-mirror-promote-arm
       - bin/omarchy-mirror-copy-stage
       - bin/omarchy-mirror-upload
+      - bin/omarchy-mirror-update-packages
+      - bin/omarchy-mirror-update-floor
       - tests/**
       - .github/workflows/arm-staging.yml
   pull_request:
@@ -19,6 +21,8 @@ on:
       - bin/omarchy-mirror-promote-arm
       - bin/omarchy-mirror-copy-stage
       - bin/omarchy-mirror-upload
+      - bin/omarchy-mirror-update-packages
+      - bin/omarchy-mirror-update-floor
       - tests/**
       - .github/workflows/arm-staging.yml
 

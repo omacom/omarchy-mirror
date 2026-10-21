@@ -134,7 +134,7 @@ class SyncArmTest(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root)
         (self.root / "bin").mkdir()
-        for script in ("omarchy-mirror-sync-arm", "omarchy-mirror-upload-arm"):
+        for script in ("omarchy-mirror-sync-arm", "omarchy-mirror-upload-arm", "omarchy-mirror-update-floor"):
             shutil.copy(BIN / script, self.root / "bin")
         (self.root / "config").mkdir()
         for allow in ("arm-allow-files-only", "arm-allow-null-records"):
@@ -188,7 +188,8 @@ class SyncArmTest(unittest.TestCase):
         self.assertEqual(len(published), 1, calls)
         # Every database was up before the call that published the stamp began.
         self.assertIn("dbs-before:yes", published[0])
-        self.assertEqual(calls.index(published[0]), 2, calls)
+        transfers = [call for call in calls if call.startswith("copy ")]
+        self.assertEqual(transfers.index(published[0]), 2, calls)
 
 
 if __name__ == "__main__":

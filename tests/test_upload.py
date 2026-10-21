@@ -40,13 +40,13 @@ class UploadTest(unittest.TestCase):
         result = self.upload(failing_step="never")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
+        self.assertEqual(self.calls(), ["lsf", "copy", "copy", "copy", "sync", "lsf"])
 
     def test_a_failed_database_upload_stops_before_the_prune(self):
         result = self.upload(failing_step="--include **/*.db*")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.calls(), ["copy", "copy", "copy"])
+        self.assertEqual(self.calls(), ["lsf", "copy", "copy", "copy"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,93 @@
+name: Update selected mirror packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Package names, optionally name=version (space-separated)"
+        required: true
+        type: string
+      architecture:
+        description: "Mirror architecture"
+        type: choice
+        options: [x86_64, aarch64]
+        default: x86_64
+      promote_stable:
+        description: "Promote the same updates to stable after verifying rc"
+        type: boolean
+        default: true
+      apply:
+        description: "Publish updates (unchecked prepares a read-only plan)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One emergency update at a time. Do not overlap this job with a full release
+# snapshot sync on the mirror host; the metadata checks detect intervening
+# changes, but are not a cross-host publication lock.
+concurrency:
+  group: mirror-package-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ${{ inputs.architecture == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container:
+      image: ${{ inputs.architecture == 'aarch64' && 'menci/archlinuxarm@sha256:3e1074c407fc1a57c2a2117af6920c96a7cc906fa6f1f2da8a4a7fd3aa2c2f4e' || 'archlinux:base' }}
+    environment: mirror-update
+    timeout-minutes: 120
+    steps:
+      - name: Install repository tools
+        env:
+          ARCHITECTURE: ${{ inputs.architecture }}
+        run: |
+          keyring=archlinux
+          if [[ $ARCHITECTURE == "aarch64" ]]; then
+            keyring=archlinuxarm
+          fi
+          pacman-key --init
+          pacman-key --populate "$keyring"
+          pacman -Syu --noconfirm --needed python rclone git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare, validate and optionally publish the selected updates
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+          PROMOTE_STABLE: ${{ inputs.promote_stable }}
+          APPLY: ${{ inputs.apply }}
+          RCLONE_CONFIG_OMARCHY_TYPE: s3
+          RCLONE_CONFIG_OMARCHY_PROVIDER: Cloudflare
+          RCLONE_CONFIG_OMARCHY_ENDPOINT: https://220c20627547d8661d630c98a00a79aa.r2.cloudflarestorage.com
+          RCLONE_CONFIG_OMARCHY_ACCESS_KEY_ID: ${{ secrets.MIRROR_R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_OMARCHY_SECRET_ACCESS_KEY: ${{ secrets.MIRROR_R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_OMARCHY_NO_CHECK_BUCKET: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a packages <<< "$PACKAGES"
+          args=(--architecture "$ARCHITECTURE" --work mirror-update)
+          if [[ $PROMOTE_STABLE == "true" ]]; then
+            args+=(--promote-stable)
+          fi
+          if [[ $APPLY == "true" ]]; then
+            args+=(--apply)
+          fi
+          python bin/omarchy-mirror-update-packages "${args[@]}" -- "${packages[@]}"
+
+      - name: Record the update plan and result
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f mirror-update/plan.json ]]; then
+            {
+              printf '```json\n'
+              cat mirror-update/plan.json
+              printf '\n```\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

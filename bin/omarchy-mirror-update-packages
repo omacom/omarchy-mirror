@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Publish selected signed Arch packages into otherwise frozen mirror channels."""
+
+import argparse
+import base64
+from collections import defaultdict
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tarfile
+from urllib.error import HTTPError
+from urllib.request import urlopen
+
+
+NAME = re.compile(r"[a-z0-9][a-z0-9@._+\-]*\Z")
+FLOORS = runpy.run_path(str(Path(__file__).with_name("omarchy-mirror-update-floor")))
+FLOOR = FLOORS["FLOOR"]
+LAYOUTS = {
+    "x86_64": ("https://mirror.omarchy.org", ["core", "extra", "multilib"], "archlinux"),
+    "aarch64": ("https://arm-mirror.omarchy.org", ["core", "extra", "alarm", "aur"], "archlinuxarm"),
+}
+
+
+def run(argv):
+    result = subprocess.run([str(arg) for arg in argv], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"{argv[0]} failed: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def file_digest(filename):
+    checksum = hashlib.sha256()
+    with open(filename, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checksum.update(chunk)
+    return checksum.hexdigest()
+
+
+def fetch(url, optional=False):
+    try:
+        with urlopen(url, timeout=60) as response:
+            data = response.read(128 * 1024 * 1024 + 1)
+            if len(data) > 128 * 1024 * 1024:
+                raise ValueError(f"Metadata is too large: {url}")
+            return data
+    except HTTPError as error:
+        if optional and error.code == 404:
+            return None
+        raise
+
+
+def database(data):
+    records = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
+        members = archive.getmembers()
+        for member in members:
+            parts = Path(member.name).parts
+            if member.isdir() and len(parts) == 1 and parts[0] not in (".", ".."):
+                continue
+            if (not member.isfile() or len(parts) != 2 or parts[0] in (".", "..")
+                    or parts[1] not in ("desc", "depends", "files", "deltas")):
+                raise ValueError(f"Unexpected database member: {member.name}")
+            if parts[1] != "desc":
+                continue
+            fields = {}
+            for entry in archive.extractfile(member).read().decode().strip().split("\n\n"):
+                key, *values = entry.splitlines()
+                if not re.fullmatch(r"%[A-Z0-9_]+%", key) or key in fields:
+                    raise ValueError(f"Malformed database record: {member.name}")
+                fields[key] = values
+            name = one(fields, "NAME")
+            if not NAME.fullmatch(name) or name in records:
+                raise ValueError(f"Invalid or duplicate package: {name}")
+            records[name] = fields
+    return records
+
+
+def one(record, key):
+    values = record.get(f"%{key}%", [])
+    if len(values) != 1 or not values[0]:
+        raise ValueError(f"Missing or invalid {key} in package metadata")
+    return values[0]
+
+
+def repository_path(arch, repo):
+    return f"{repo}/os/{arch}" if arch == "x86_64" else f"{arch}/{repo}"
+
+
+def remote_bytes(remote, relative):
+    result = subprocess.run(["rclone", "cat", f"{remote.rstrip('/')}/{relative}"], capture_output=True)
+    if result.returncode:
+        raise RuntimeError(f"Cannot read {remote}/{relative}: {result.stderr.decode().strip()}")
+    return result.stdout
+
+
+def prepare_keyring(source, work):
+    destination = work / "keyring.gpg"
+    if source.read_bytes().startswith(b"-----BEGIN"):
+        run(["gpg", "--batch", "--dearmor", "--output", destination, source])
+    else:
+        shutil.copyfile(source, destination)
+    (work / "gnupg").mkdir(mode=0o700)
+    return destination
+
+
+def download_package(upstream, arch, repo, record, work, keyring):
+    name, version = one(record, "NAME"), one(record, "VERSION")
+    filename = one(record, "FILENAME")
+    if Path(filename).name != filename or filename in (".", ".."):
+        raise ValueError(f"Unsafe package filename: {filename}")
+    if one(record, "ARCH") not in (arch, "any"):
+        raise ValueError(f"Wrong architecture for {name}")
+    size, checksum = int(one(record, "CSIZE")), one(record, "SHA256SUM")
+    if size <= 0 or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise ValueError(f"Invalid size or checksum for {name}")
+    package = work / filename
+    with urlopen(f"{upstream}/{repository_path(arch, repo)}/{filename}", timeout=120) as source:
+        with package.open("wb") as destination:
+            total = 0
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > size:
+                    raise ValueError(f"Package exceeds its advertised size: {name}")
+                destination.write(chunk)
+    if total != size or file_digest(package) != checksum:
+        raise ValueError(f"Package checksum/size mismatch: {name}")
+    signature = base64.b64decode(one(record, "PGPSIG"), validate=True)
+    signature_file = package.with_name(filename + ".sig")
+    signature_file.write_bytes(signature)
+    status = run(["gpgv", "--homedir", work / "gnupg", "--status-fd", "1",
+                  "--keyring", keyring, signature_file, package])
+    if "[GNUPG:] VALIDSIG " not in status or any(
+            f"[GNUPG:] {bad} " in status for bad in ("REVKEYSIG", "EXPKEYSIG", "EXPSIG", "BADSIG")):
+        raise ValueError(f"Package signature is not valid: {name}")
+    signer = next(line.split()[2] for line in status.splitlines() if line.startswith("[GNUPG:] VALIDSIG "))
+    return {"name": name, "version": version, "repo": repo, "record": record, "signer": signer,
+            "path": package, "signature": signature_file}
+
+
+def prepare_channel(args, channel, selected, work):
+    arch, repos = args.architecture, LAYOUTS[args.architecture][1]
+    folder = work / channel
+    folder.mkdir()
+    public = getattr(args, f"{channel}_url").rstrip("/")
+    remote = getattr(args, f"{channel}_remote").rstrip("/")
+    if args.apply:
+        floor = FLOORS["read_floor"](remote)
+    else:
+        value = fetch(f"{public}/{FLOOR}", optional=True)
+        floor = FLOORS["parse_floor"](value) if value is not None else {}
+    if floor and floor["architecture"] != arch:
+        raise ValueError(f"Package-update floor architecture mismatch in {channel}")
+    originals, records = {}, {}
+    for repo in repos:
+        prefix = repository_path(arch, repo)
+        if args.apply:
+            names = set(run(["rclone", "lsf", "--files-only", "--max-depth", "1", f"{remote}/{prefix}"]).splitlines())
+            if any(name.startswith((f"{repo}.db", f"{repo}.files")) and name.endswith(".sig") for name in names):
+                raise ValueError(f"{channel}/{repo} has signed databases; refusing to discard their signatures")
+            unsupported = {f"{repo}.{kind}.tar.{suffix}" for kind in ("db", "files") for suffix in ("xz", "zst", "bz2")}
+            if names & unsupported:
+                raise ValueError(f"Unsupported metadata compression in {channel}/{repo}")
+        else:
+            for kind in ("db", "files", "db.tar.gz", "files.tar.gz"):
+                if fetch(f"{public}/{prefix}/{repo}.{kind}.sig", optional=True) is not None:
+                    raise ValueError(f"{channel}/{repo} has signed databases")
+        data = remote_bytes(remote, f"{prefix}/{repo}.db") if args.apply else fetch(f"{public}/{prefix}/{repo}.db")
+        originals[repo] = data
+        records[repo] = database(data)
+        (folder / f"{repo}.db.tar.gz").write_bytes(data)
+    updates, previous = defaultdict(list), {}
+    for package in selected:
+        name, repo = package["name"], package["repo"]
+        existing_repos = [item for item in repos if name in records[item]]
+        if not existing_repos:
+            previous[name] = None
+            updates[repo].append(package)
+            continue
+        if existing_repos != [repo]:
+            raise ValueError(f"{name} moved repositories in {channel}; use a full snapshot refresh")
+        current = records[repo][name]
+        previous[name] = one(current, "VERSION")
+        comparison = int(run(["vercmp", package["version"], one(current, "VERSION")]).strip())
+        if comparison < 0:
+            raise ValueError(f"Refusing to downgrade {channel}/{name}")
+        if comparison == 0:
+            if one(current, "SHA256SUM") != one(package["record"], "SHA256SUM"):
+                raise ValueError(f"Same version has different contents: {channel}/{name}")
+        else:
+            updates[repo].append(package)
+    metadata, staged_records = {}, dict(records)
+    for repo, packages in updates.items():
+        prefix = repository_path(arch, repo)
+        files = remote_bytes(remote, f"{prefix}/{repo}.files") if args.apply else fetch(f"{public}/{prefix}/{repo}.files")
+        original_files = database(files)
+        if original_files != records[repo]:
+            raise ValueError(f"{channel}/{repo} databases disagree; retry after its current update")
+        (folder / f"{repo}.files.tar.gz").write_bytes(files)
+        run(["repo-add", "--quiet", "--include-sigs", "--prevent-downgrade",
+             folder / f"{repo}.db.tar.gz", *[package["path"] for package in packages]])
+        updated = database((folder / f"{repo}.db.tar.gz").read_bytes())
+        updated_files = database((folder / f"{repo}.files.tar.gz").read_bytes())
+        if updated != updated_files or updated.keys() != records[repo].keys() | {package["name"] for package in packages}:
+            raise ValueError(f"Unexpected database change in {channel}/{repo}")
+        chosen = {package["name"]: package for package in packages}
+        for name, old in records[repo].items():
+            if name not in chosen and updated[name] != old:
+                raise ValueError(f"Unselected package changed: {channel}/{name}")
+        for name, package in chosen.items():
+            for key in ("NAME", "VERSION", "FILENAME", "CSIZE", "SHA256SUM", "PGPSIG"):
+                if one(updated[name], key) != one(package["record"], key):
+                    raise ValueError(f"Updated metadata does not match signed package: {channel}/{name}/{key}")
+        metadata[repo] = {"db": originals[repo], "files": files}
+        staged_records[repo] = updated
+    next_floor = floor
+    if updates:
+        next_floor = FLOORS["merge_floors"](floor, {
+            "schema": 1, "architecture": arch, "packages": {
+                package["name"]: {"version": package["version"], "sha256": one(package["record"], "SHA256SUM")}
+                for packages in updates.values() for package in packages}})
+    for name, required in next_floor.get("packages", {}).items():
+        matches = [data[name] for data in staged_records.values() if name in data]
+        if len(matches) != 1:
+            raise ValueError(f"Missing or ambiguous protected package: {channel}/{name}")
+        FLOORS["check_package"](name, one(matches[0], "VERSION"), one(matches[0], "SHA256SUM"), required)
+    # Resolve against the destination's complete package set, never the live
+    # upstream repositories or the runner's installed packages. Installs nothing.
+    dbpath = folder / "pacman"
+    (dbpath / "sync").mkdir(parents=True)
+    (dbpath / "local").mkdir()
+    config = ["[options]", f"Architecture = {arch}", "SigLevel = Required DatabaseOptional"]
+    for repo in repos:
+        shutil.copyfile(folder / f"{repo}.db.tar.gz", dbpath / "sync" / f"{repo}.db")
+        config.extend([f"[{repo}]", f"Server = {public}/{repository_path(arch, repo)}"])
+    config_file = folder / "pacman.conf"
+    config_file.write_text("\n".join(config) + "\n")
+    run(["pacman", "--config", config_file, "--dbpath", dbpath,
+         "--logfile", folder / "pacman.log", "-Sp", "--print-format", "%n %v",
+         *[package["name"] for package in selected]])
+    return {"name": channel, "folder": folder, "remote": remote, "updates": updates,
+            "metadata": metadata, "originals": originals, "previous": previous, "floor": floor, "next_floor": next_floor}
+
+
+def publish_channel(args, prepared, work):
+    channel, remote = prepared["name"], prepared["remote"]
+    # Uploads are additive: old packages and unrelated metadata are retained.
+    # Check the live origin, bypassing the CDN, before replacing its metadata.
+    def unchanged():
+        if FLOORS["read_floor"](remote) != prepared["floor"]:
+            raise ValueError(f"{channel}'s package-update floor changed during preparation")
+        for repo, original in prepared["originals"].items():
+            prefix = repository_path(args.architecture, repo)
+            if remote_bytes(remote, f"{prefix}/{repo}.db") != original:
+                raise ValueError(f"{channel}/{repo} changed during preparation; refusing stale metadata")
+        for repo, original in prepared["metadata"].items():
+            prefix = repository_path(args.architecture, repo)
+            if remote_bytes(remote, f"{prefix}/{repo}.files") != original["files"]:
+                raise ValueError(f"{channel}/{repo}.files changed during preparation")
+
+    unchanged()
+    for repo, packages in prepared["updates"].items():
+        prefix = repository_path(args.architecture, repo)
+        for package in packages:
+            for source in (package["path"], package["signature"]):
+                run(["rclone", "copyto", source, f"{remote}/{prefix}/{source.name}", "--immutable"])
+                check = work / f"verify-{channel}-{source.name}"
+                run(["rclone", "copyto", f"{remote}/{prefix}/{source.name}", check])
+                if file_digest(check) != file_digest(source):
+                    raise ValueError(f"Uploaded package/signature verification failed: {source.name}")
+                check.unlink()
+    unchanged()
+    for repo in prepared["updates"]:
+        prefix = repository_path(args.architecture, repo)
+        for kind, alias in (("files", "files.tar.gz"), ("files", "files"), ("db", "db.tar.gz"), ("db", "db")):
+            source = prepared["folder"] / f"{repo}.{kind}.tar.gz"
+            run(["rclone", "copyto", source, f"{remote}/{prefix}/{repo}.{alias}"])
+    for repo in prepared["updates"]:
+        prefix = repository_path(args.architecture, repo)
+        for kind in ("db", "files"):
+            expected = (prepared["folder"] / f"{repo}.{kind}.tar.gz").read_bytes()
+            for alias in (kind, f"{kind}.tar.gz"):
+                if remote_bytes(remote, f"{prefix}/{repo}.{alias}") != expected:
+                    raise ValueError(f"Published database verification failed: {channel}/{repo}.{alias}")
+    # Check actual package versions and checksums on later full publications:
+    # a freshly timestamped stage can still have an old upstream package.
+    marker = work / f"{channel}-{FLOOR}"
+    marker.write_text(json.dumps(prepared["next_floor"], sort_keys=True) + "\n")
+    run(["rclone", "copyto", marker, f"{remote}/{FLOOR}"])
+    if remote_bytes(remote, FLOOR) != marker.read_bytes():
+        raise ValueError(f"Published package-update floor verification failed: {channel}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("packages", nargs="+", help="Package names, optionally pinned as name=version")
+    parser.add_argument("--architecture", choices=LAYOUTS, default="x86_64")
+    parser.add_argument("--upstream", help="Source mirror root (defaults to the architecture's edge mirror)")
+    parser.add_argument("--keyring", type=Path, help="Trusted distribution public keyring")
+    parser.add_argument("--work", type=Path, required=True, help="New, empty directory for packages and the plan")
+    parser.add_argument("--promote-stable", action="store_true", help="Publish the same selected updates to stable after verifying rc")
+    parser.add_argument("--apply", action="store_true", help="Publish updates; otherwise prepare and validate a read-only plan")
+    for channel in ("rc", "stable"):
+        parser.add_argument(f"--{channel}-remote", default=None)
+        parser.add_argument(f"--{channel}-url", default=None)
+    args = parser.parse_args()
+    upstream, repos, keyring_name = LAYOUTS[args.architecture]
+    args.upstream = (args.upstream or upstream).rstrip("/")
+    args.keyring = args.keyring or Path(f"/usr/share/pacman/keyrings/{keyring_name}.gpg")
+    arm = "arm-" if args.architecture == "aarch64" else ""
+    suffix = "-arm" if arm else ""
+    for channel in ("rc", "stable"):
+        setattr(args, f"{channel}_remote", getattr(args, f"{channel}_remote") or f"omarchy:omarchy-mirror{suffix}-{channel}")
+        setattr(args, f"{channel}_url", getattr(args, f"{channel}_url") or f"https://{arm}{channel}-mirror.omarchy.org")
+    if args.work.exists() and any(args.work.iterdir()):
+        parser.error("--work must be a new or empty directory")
+    args.work.mkdir(parents=True, exist_ok=True)
+    plan = {"architecture": args.architecture, "source": args.upstream, "apply": args.apply,
+            "packages": [], "channels": [], "published": []}
+    try:
+        requested = {}
+        for specification in args.packages:
+            name, separator, version = specification.partition("=")
+            if not NAME.fullmatch(name) or name in requested or (separator and not version):
+                raise ValueError(f"Invalid or duplicate package selection: {specification}")
+            requested[name] = version if separator else None
+        source = {}
+        for repo in repos:
+            for name, record in database(fetch(f"{args.upstream}/{repository_path(args.architecture, repo)}/{repo}.db")).items():
+                if name in requested:
+                    if name in source:
+                        raise ValueError(f"Ambiguous upstream package: {name}")
+                    if requested[name] and requested[name] != one(record, "VERSION"):
+                        raise ValueError(f"Requested {name}={requested[name]}, source serves {one(record, 'VERSION')}")
+                    source[name] = (repo, record)
+        if source.keys() != requested.keys():
+            raise ValueError(f"Packages missing from upstream: {', '.join(sorted(requested.keys() - source.keys()))}")
+        keyring = prepare_keyring(args.keyring, args.work)
+        selected = [download_package(args.upstream, args.architecture, *source[name], args.work, keyring) for name in requested]
+        for package in selected:
+            item = {key: package[key] for key in ("name", "version", "repo", "signer")}
+            item["filename"] = package["path"].name
+            item["sha256"] = one(package["record"], "SHA256SUM")
+            plan["packages"].append(item)
+        channels = [prepare_channel(args, channel, selected, args.work)
+                    for channel in (["rc", "stable"] if args.promote_stable else ["rc"])]
+        for channel in channels:
+            plan["channels"].append({"channel": channel["name"], "updates": [
+                {"name": package["name"], "from": channel["previous"][package["name"]], "to": package["version"]}
+                for packages in channel["updates"].values() for package in packages]})
+        plan["status"] = "prepared"
+        (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+        print(json.dumps(plan, indent=2), flush=True)
+        if args.apply:
+            for channel in channels:
+                if not channel["updates"]:
+                    continue
+                plan["publishing"] = channel["name"]
+                (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+                publish_channel(args, channel, args.work)
+                plan["published"].append(channel["name"])
+                del plan["publishing"]
+                (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+        plan["status"] = "complete"
+        return 0
+    except (OSError, ValueError, RuntimeError, tarfile.TarError) as error:
+        plan["status"], plan["error"] = "failed", str(error)
+        print(str(error), file=sys.stderr)
+        return 1
+    finally:
+        (args.work / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -69,6 +69,9 @@ PY
   fi
 fi
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+"$SCRIPT_DIR/omarchy-mirror-update-floor" --stage "$STAGE" --r2 "$R2"
+
 # Packages above 200 MiB go up in parts (R2 takes 5 GiB in one request, 5 TiB
 # in parts). The checksum R2 lists for those is not the file's, so rclone
 # stores the file's MD5 with the object; a promote compares by it, and without
@@ -82,7 +85,7 @@ COMMON=(--fast-list --s3-no-head --transfers=64 --checkers=64
 # at the root, which omarchy-release compares.
 INDEX=(--include '**/*.db' --include '**/*.db.*' --include '**/*.files' --include '**/*.files.*')
 STAMPS=(--include '**/lastsync' --include '/lastsync')
-NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --exclude '**/*.files.*' --exclude '**/lastsync' --exclude '/lastsync')
+NOT_INDEX=(--exclude '**/*.db' --exclude '**/*.db.*' --exclude '**/*.files' --exclude '**/*.files.*' --exclude '**/lastsync' --exclude '/lastsync' --exclude '/package-update-floor.json')
 
 # How a file is judged unchanged. Databases are small and are what clients
 # read first, so they are always compared by checksum. Between two buckets
@@ -116,6 +119,8 @@ rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${STAMPS[@]}"
 
 # 4) Prune what is no longer in the stage (safe after the databases)
 echo "Prune removed files on $R2"
-rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}"
+rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" --exclude '/package-update-floor.json'
+
+"$SCRIPT_DIR/omarchy-mirror-update-floor" --stage "$STAGE" --r2 "$R2" --commit
 
 echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"

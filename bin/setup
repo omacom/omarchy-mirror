@@ -3,7 +3,7 @@
 # Meant to be run as root on an Ubuntu machine
 
 # General dependencies
-apt install rclone vim
+apt install rclone vim python3 makepkg
 
 # Setup rclone (insert real values)
 mkdir -p ~/.config/rclone

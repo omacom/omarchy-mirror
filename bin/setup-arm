@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-apt-get install -y gnupg python3 curl
+apt-get install -y gnupg python3 curl makepkg
 
 # Debian and Ubuntu package an rclone that is years old.
 curl -fsSL -o /tmp/rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb

@@ -17,6 +17,10 @@ class CopyStageTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         (self.root / "bin").mkdir()
         shutil.copy(BIN / "omarchy-mirror-copy-stage", self.root / "bin")
+        shutil.copy(BIN / "omarchy-mirror-update-floor", self.root / "bin")
+        rclone = self.root / "bin/rclone"
+        rclone.write_text("#!/bin/bash\nexit 0\n")
+        rclone.chmod(0o755)
         upload = self.root / "bin/omarchy-mirror-upload"
         upload.write_text('#!/bin/bash\necho "$*" >> "$(dirname "$0")/../uploads"\n')
         upload.chmod(0o755)
@@ -37,6 +41,7 @@ class CopyStageTest(unittest.TestCase):
             [str(self.root / "bin/omarchy-mirror-copy-stage"), "--from", f"{source}/", "--to", f"{target}/", "--r2", "omarchy:target"],
             capture_output=True,
             text=True,
+            env={**os.environ, "PATH": f"{self.root}/bin:{os.environ['PATH']}"},
         )
 
     def uploads(self):

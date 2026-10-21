@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Keep full snapshot publication from undoing targeted package updates."""
+
+import argparse
+import io
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+FLOOR = "package-update-floor.json"
+LAYOUTS = {"x86_64": ("core", "extra", "multilib"), "aarch64": ("core", "extra", "alarm", "aur")}
+
+
+def run(args):
+    result = subprocess.run([str(arg) for arg in args], capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode().strip() or f"{args[0]} failed")
+    return result.stdout
+
+
+def parse_floor(data):
+    try:
+        value = json.loads(data)
+    except ValueError:
+        raise ValueError("Unreadable package-update floor") from None
+    if (not isinstance(value, dict) or value.get("schema") != 1
+            or not isinstance(value.get("architecture"), str) or value["architecture"] not in LAYOUTS
+            or not isinstance(value.get("packages"), dict) or not value["packages"]):
+        raise ValueError("Unreadable package-update floor")
+    for name, record in value["packages"].items():
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9@._+\-]*", name) or not isinstance(record, dict)
+                or not isinstance(record.get("version"), str) or not record["version"]
+                or not isinstance(record.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])):
+            raise ValueError("Unreadable package-update floor record")
+    return value
+
+
+def read_floor(remote):
+    names = run(["rclone", "lsf", remote, "--files-only", "--max-depth", "1"]).decode().splitlines()
+    if FLOOR not in names:
+        return {}
+    return parse_floor(run(["rclone", "cat", f"{remote.rstrip('/')}/{FLOOR}"]))
+
+
+def source_floor(stage):
+    if ":" in stage:
+        return read_floor(stage)
+    path = Path(stage) / FLOOR
+    return parse_floor(path.read_bytes()) if path.exists() else {}
+
+
+def merge_floors(left, right):
+    if not left:
+        return right
+    if not right:
+        return left
+    if left["architecture"] != right["architecture"]:
+        raise ValueError("Package-update floor architecture mismatch")
+    packages = dict(left["packages"])
+    for name, record in right["packages"].items():
+        if name not in packages:
+            packages[name] = record
+            continue
+        comparison = int(run(["vercmp", record["version"], packages[name]["version"]]))
+        if comparison == 0 and record["sha256"] != packages[name]["sha256"]:
+            raise ValueError(f"Conflicting package-update floors for {name}")
+        if comparison > 0:
+            packages[name] = record
+    return {"schema": 1, "architecture": left["architecture"], "packages": packages}
+
+
+def check_package(name, version, checksum, required):
+    comparison = int(run(["vercmp", version, required["version"]]))
+    if comparison < 0:
+        raise ValueError(f"{name} is older than targeted package updates ({version} < {required['version']})")
+    if comparison == 0 and checksum != required["sha256"]:
+        raise ValueError(f"{name} does not match the targeted update's checksum")
+
+
+def verify_stage(stage, floor):
+    if not floor:
+        return
+    arch, pending = floor["architecture"], dict(floor["packages"])
+    for repo in LAYOUTS[arch]:
+        relative = f"{repo}/os/{arch}/{repo}.db" if arch == "x86_64" else f"{arch}/{repo}/{repo}.db"
+        data = run(["rclone", "cat", f"{stage.rstrip('/')}/{relative}"]) if ":" in stage else (Path(stage) / relative).read_bytes()
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            for member in archive:
+                if not member.isfile() or not member.name.endswith("/desc"):
+                    continue
+                fields = {}
+                for entry in archive.extractfile(member).read().decode().strip().split("\n\n"):
+                    key, *values = entry.splitlines()
+                    fields[key] = values
+                name = fields.get("%NAME%", [""])[0]
+                if name not in pending:
+                    continue
+                required = pending[name]
+                version = fields["%VERSION%"][0]
+                check_package(name, version, fields.get("%SHA256SUM%", [""])[0], required)
+                del pending[name]
+        if not pending:
+            return
+    raise ValueError(f"Snapshot is missing targeted package updates: {', '.join(sorted(pending))}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--stage", required=True)
+    parser.add_argument("--r2", required=True)
+    parser.add_argument("--commit", action="store_true", help="Propagate update floors after a successful publication")
+    args = parser.parse_args()
+    try:
+        target, source = read_floor(args.r2), source_floor(args.stage)
+        merged = merge_floors(target, source)
+        verify_stage(args.stage, merged)
+        if args.commit and merged != target:
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / FLOOR
+                path.write_text(json.dumps(merged, sort_keys=True) + "\n")
+                run(["rclone", "copyto", path, f"{args.r2.rstrip('/')}/{FLOOR}"])
+        return 0
+    except (OSError, ValueError, RuntimeError, KeyError, IndexError, tarfile.TarError) as error:
+        print(str(error) or "Unreadable package-update floor", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
