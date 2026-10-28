@@ -185,24 +185,55 @@ class MirrorTest(unittest.TestCase):
         self.assertEqual(self.requests[PREFIX + self.first[0]], 0)
         self.assertFalse((self.stage / "lastsync").exists())
 
-    def test_files_only_package_requires_exact_exception_and_is_degraded(self):
+    def test_files_only_record_is_published_as_upstream_serves_it(self):
+        # Arch Linux ARM's extra.files kept qemu-block-gluster after QEMU 11.1
+        # dropped it, and qemu-system-cris before that: a record for a package
+        # its .db no longer lists and its mirrors no longer serve.
         orphan = ("orphan-1-1-any.pkg.tar.xz", b"orphan", b"signature")
-        self.run_sync()
-        old_db = (self.stage / "aarch64/core/core.db").read_bytes()
-        marker = self.stage / "aarch64/core/lastsync"
-        marker.write_text("old freshness")
         self.files[PREFIX + "core.files"] = database([self.first, orphan])
-        self.run_sync(success=False)
-        self.assertEqual(self.status()["status"], "failed")
-        self.run_sync("--allow-files-only", "aarch64/core/different-1-1-any.pkg.tar.xz", success=False)
-        result = self.run_sync("--allow-files-only", f"aarch64/core/{orphan[0]}", "--prune", code=3)
-        self.assertIn("not staging it", result.stderr)
+        result = self.run_sync("--json")
+        self.assertIn(f"upstream .files lists 1 packages its .db does not, not staging them: {orphan[0]}",
+                      result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["metadata_published"])
+        self.assertFalse(report["published_degraded"])
+        self.assertEqual(report["repositories"]["aarch64/core"]["files_only"], [orphan[0]])
+        repo = self.stage / "aarch64/core"
+        self.assertEqual((repo / "core.db").read_bytes(), self.files[PREFIX + "core.db"])
+        self.assertEqual((repo / "core.files").read_bytes(), self.files[PREFIX + "core.files"])
+        self.assertTrue((repo / "lastsync").is_file())
         self.assertEqual(self.requests[PREFIX + orphan[0]], 0)
-        self.assertFalse((self.stage / "aarch64/core" / orphan[0]).exists())
-        self.assertEqual((self.stage / "aarch64/core/core.db").read_bytes(), old_db)
-        self.assertEqual(marker.read_text(), "old freshness")
-        self.assertEqual(self.status()["status"], "degraded")
-        self.assertFalse(self.status()["metadata_published"])
+        self.assertFalse((repo / orphan[0]).exists())
+
+    def test_files_ahead_of_db_during_an_update_is_not_published(self):
+        # Upstream mid-update: .files already lists a new package, .db does not
+        # yet. The second fetch of the .db sees it change, so nothing new is
+        # published until a run reads both from one generation.
+        self.run_sync()
+        repo = self.stage / "aarch64/core"
+        old_db = (repo / "core.db").read_bytes()
+        old_files = (repo / "core.files").read_bytes()
+        (repo / "lastsync").write_text("old freshness")
+        newcomer = ("newcomer-1-1-aarch64.pkg.tar.xz", b"new package", b"new signature")
+        self.files[PREFIX + "core.files"] = database([self.first, newcomer])
+        self.requests.clear()
+
+        def finish_update(path):
+            if path == PREFIX + "core.db" and self.requests[path] == 2:
+                self.publish([self.first, newcomer])
+
+        self.hook = finish_update
+        result = self.run_sync(success=False)
+        self.assertIn("upstream database changed", result.stderr)
+        self.assertEqual((repo / "core.db").read_bytes(), old_db)
+        self.assertEqual((repo / "core.files").read_bytes(), old_files)
+        self.assertEqual((repo / "lastsync").read_text(), "old freshness")
+        self.hook = lambda path: None
+        self.run_sync()
+        self.assertEqual(self.status()["status"], "complete")
+        self.assertEqual(self.status()["repositories"]["aarch64/core"]["files_only"], [])
+        self.assertEqual((repo / newcomer[0]).read_bytes(), newcomer[1])
 
     def test_older_packages_missing_from_files_db_are_still_downloaded(self):
         second = ("legacy-1-1-any.pkg.tar.xz", b"legacy package", b"legacy signature")
@@ -279,7 +310,7 @@ class MirrorTest(unittest.TestCase):
         orphan = ("orphan-1-1-any.pkg.tar.xz", b"orphan", b"sig")
         self.publish([self.first, second])
         self.files[PREFIX + "core.files"] = database([self.first, orphan])
-        result = self.run_sync("--allow-files-only", f"aarch64/core/{orphan[0]}", code=3)
+        result = self.run_sync()
         self.assertIn("upstream .files omits 1 packages", result.stderr)
         self.assertEqual((self.stage / "aarch64/core" / second[0]).read_bytes(), second[1])
         self.assertEqual(self.status()["repositories"]["aarch64/core"]["missing_from_files"], [second[0]])
@@ -368,7 +399,7 @@ class MirrorTest(unittest.TestCase):
     def test_insufficient_space_fails_before_downloads(self):
         args = SimpleNamespace(stage=self.stage, upstream=self.upstream,
                                arch=["aarch64"], repos=["core"], dry_run=False,
-                               timeout=2, retries=1, workers=1, recover_null_records=False, allow_files_only=[])
+                               timeout=2, retries=1, workers=1, recover_null_records=False)
         with patch("shutil.disk_usage", return_value=SimpleNamespace(free=1)):
             with redirect_stderr(io.StringIO()):
                 with self.assertRaisesRegex(API["SyncError"], "Insufficient disk space"):

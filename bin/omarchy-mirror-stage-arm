@@ -340,19 +340,24 @@ def sync(args):
             if any(packages[name] != package
                    for name, package in file_manifest.packages.items() if name in packages):
                 raise SyncError(f"{relative}: .db and .files disagree; upstream may be syncing, rerun later")
+            # pacman installs from the .db alone; .files only answers pacman -F.
+            # A package one lists and the other does not is upstream's own
+            # state, which every upstream mirror serves: QEMU 11.1 dropped
+            # qemu-block-gluster and Arch Linux ARM's extra.files kept it. So
+            # either difference is reported and upstream's metadata is published
+            # unchanged; only .db packages are staged. A rolling update is caught
+            # below when either database changes between its two fetches. One
+            # that holds still across both is published as it stands, and until
+            # the next run pacman -F can name a package pacman -S cannot find.
             files_only = sorted(set(file_manifest.packages) - set(packages))
             missing_from_files = sorted(set(packages) - set(file_manifest.packages))
-            for name in files_only:
-                if f"{relative}/{name}" not in args.allow_files_only:
-                    raise SyncError(f"{relative}: .files-only package {name}; upstream may be syncing. "
-                                    "Rerun later, or investigate before using "
-                                    f"--allow-files-only {relative}/{name} for degraded package staging")
-                progress(f"{relative}: WARNING: explicitly allowed .files-only package {name}; "
-                         "not staging it; metadata remains degraded")
+            if files_only:
+                progress(f"{relative}: upstream .files lists {len(files_only)} packages its .db does not, "
+                         f"not staging them: {' '.join(files_only)}")
             if missing_from_files:
                 progress(f"{relative}: upstream .files omits {len(missing_from_files)} packages; "
                          "preserving upstream metadata and downloading all .db packages")
-            degraded |= bool(package_manifest.recovered or files_only)
+            degraded |= bool(package_manifest.recovered)
             # hashlib releases the GIL, so the threads hash on separate cores.
             with ThreadPoolExecutor(max_workers=args.workers) as pool:
                 valid = pool.map(lambda package: valid_package(args.stage / relative / package.name, package),
@@ -491,11 +496,9 @@ def main():
     parser.add_argument("--allow-null-record", action="append", default=[], metavar="ARCH/REPO/MEMBER",
                         help="with --recover-null-records, recover only this exact investigated record; "
                              "any other all-NUL record fails; repeatable")
-    parser.add_argument("--allow-files-only", action="append", default=[], metavar="ARCH/REPO/FILENAME",
-                        help="allow this exact investigated .files-only package; exits 3 if needed; repeatable")
     parser.add_argument("--publish-degraded", action="store_true",
-                        help="publish upstream metadata unchanged even when --recover-null-records or "
-                             "--allow-files-only was needed, as every upstream mirror does; exits 0")
+                        help="publish upstream metadata unchanged even when --recover-null-records "
+                             "was needed, as every upstream mirror does; exits 0")
     parser.add_argument("--keyring", type=Path, metavar="FILE",
                         help="gpgv keyring; every package must carry a signature from it before it is staged")
     parser.add_argument("--json", action="store_true", help="print the result as JSON; progress goes to stderr")
@@ -514,11 +517,6 @@ def main():
         parser.error("--stage must be a dedicated mirror directory, not /")
     args.arch = list(dict.fromkeys(args.arch or ["aarch64"]))
     args.repos = list(dict.fromkeys(args.repos))
-    for exception in args.allow_files_only:
-        parts = exception.split("/")
-        if (len(parts) != 3 or parts[0] not in args.arch or parts[1] not in args.repos
-                or not PACKAGE_NAME.fullmatch(parts[2])):
-            parser.error("--allow-files-only must name a selected ARCH/REPO and an exact package filename")
     try:
         if args.dry_run:
             result = sync(args)
