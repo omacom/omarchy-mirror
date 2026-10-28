@@ -3,6 +3,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import hashlib
 import io
+import os
 import shutil
 import subprocess
 import tarfile
@@ -82,13 +83,14 @@ class VerifyTest(unittest.TestCase):
         self.host = f"127.0.0.1:{server.server_port}"
         self.ledger = Path(f"{self.stage}.verified.{self.host}")
 
-    def verify(self, *args):
+    def verify(self, *args, env=None):
         return subprocess.run(
             [str(VERIFY), "--stage", f"{self.stage}/", "--r2", str(self.bucket),
              "--url", f"http://{self.host}/", "--timeout", "2", *args],
             capture_output=True,
             text=True,
             timeout=120,
+            env=env,
         )
 
     def recorded(self):
@@ -167,6 +169,19 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(broken.read_bytes(), self.packages["a-1-1-x86_64.pkg.tar.zst"])
         self.assertEqual(len(self.recorded()), 2)
+
+    def test_a_failed_re_upload_does_not_keep_a_broken_package_recorded(self):
+        self.assertEqual(self.verify().returncode, 0)
+        (self.bucket / "core/os/x86_64/a-1-1-x86_64.pkg.tar.zst").write_bytes(b"x" * 200_000)
+        failing = self.root / "failing"
+        failing.mkdir()
+        (failing / "rclone").write_text("#!/bin/bash\nexit 1\n")
+        (failing / "rclone").chmod(0o755)
+
+        result = self.verify("--all", "--repair", env={**os.environ, "PATH": f"{failing}:{os.environ['PATH']}"})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.recorded(), ["core/os/x86_64/b-1-1-x86_64.pkg.tar.zst"])
 
     def test_repair_refuses_more_than_max_repair(self):
         broken = self.bucket / "core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"

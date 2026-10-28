@@ -153,6 +153,19 @@ with ThreadPoolExecutor(16) as pool, open(good, "w") as passed, open(bad, "w") a
 PY
 }
 
+# Record what passed, even when something else failed, so the next run reads
+# only what is still unproven. Entries the databases no longer name drop out,
+# and with --all so does anything that failed this time. It runs before any
+# repair, so a failed re-upload cannot leave a broken package recorded.
+record() {
+  if [[ -n $ALL ]]; then
+    sort -u "$WORK/good" >"$LEDGER.new"
+  else
+    sort -u <(comm -12 "$WORK/manifest" <(sort -u "$LEDGER")) "$WORK/good" >"$LEDGER.new"
+  fi
+  mv "$LEDGER.new" "$LEDGER"
+}
+
 pending=$(( $(wc -l <"$WORK/pending") ))
 echo "Verify $pending of $(( $(wc -l <"$WORK/manifest") )) packages at $URL"
 : >"$WORK/good"
@@ -160,6 +173,7 @@ echo "Verify $pending of $(( $(wc -l <"$WORK/manifest") )) packages at $URL"
 if (( pending > 0 )); then
   check "$WORK/pending" "$WORK/good" "$WORK/bad"
 fi
+record
 
 # Too many failures means something other than a few broken objects, such as
 # the network: re-uploading all of it would hide that. A package is uploaded
@@ -188,22 +202,16 @@ PY
   else
     echo "Re-upload $failed packages that did not read back"
     cut -d' ' -f2- "$WORK/bad" >"$WORK/bad.keys"
-    rclone copy "$STAGE" "$R2" --files-from "$WORK/bad.keys" --no-traverse --ignore-times
+    # A failed upload is not the end: the read below decides what is still bad.
+    if ! rclone copy "$STAGE" "$R2" --files-from "$WORK/bad.keys" --no-traverse --ignore-times; then
+      echo "Re-upload failed for some packages" >&2
+    fi
     check "$WORK/bad" "$WORK/repaired" "$WORK/still-bad"
     cat "$WORK/repaired" >>"$WORK/good"
     mv "$WORK/still-bad" "$WORK/bad"
+    record
   fi
 fi
-
-# Record what passed, even when something else failed, so the next run reads
-# only what is still unproven. Entries the databases no longer name drop out,
-# and with --all so does anything that failed this time.
-if [[ -n $ALL ]]; then
-  sort -u "$WORK/good" >"$LEDGER.new"
-else
-  sort -u <(comm -12 "$WORK/manifest" <(sort -u "$LEDGER")) "$WORK/good" >"$LEDGER.new"
-fi
-mv "$LEDGER.new" "$LEDGER"
 
 if [[ -s $WORK/bad ]]; then
   echo "These packages do not read back from $URL with their database's SHA-256:" >&2
