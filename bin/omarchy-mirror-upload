@@ -64,8 +64,12 @@ fi
 if [[ -n $URL ]]; then
   echo "Verify packages at $URL against the staged databases"
   "$SCRIPT_DIR/omarchy-mirror-verify" --stage "$STAGE" --r2 "$R2" --url "$URL" --repair
+  # What was just read back whole must not be replaced by the prune.
+  KEEP_VERIFIED="--ignore-existing"
 else
   echo "$R2 has no public URL in config/public-urls: packages are not read back"
+  # The prune's size check is then the only repair for a short package.
+  KEEP_VERIFIED=""
 fi
 
 # 2) Publish db/files + freshness markers
@@ -74,11 +78,10 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
   --transfers=4 \
   --include '**/*.db*' --include '**/*.files*' --include '/lastsync' --include '/lastupdate'
 
-# 3) Prune anything no longer present upstream (safe after DB update). It never
-# replaces an object that exists: what step 1c read back stays as it was read.
+# 3) Prune anything no longer present upstream (safe after DB update)
 echo "Prune removed packages on R2"
 rclone sync "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
-  --ignore-existing --size-only --no-update-modtime \
+  $KEEP_VERIFIED --size-only --no-update-modtime \
   --checkers=128 --transfers=16 \
   --exclude '**/*.db*' --exclude '**/*.files*' --exclude '/lastsync' --exclude '/lastupdate'
 

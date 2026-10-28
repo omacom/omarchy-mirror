@@ -13,6 +13,11 @@ from test_verify import stage_repo
 UPLOAD = Path(__file__).resolve().parents[1] / "bin/omarchy-mirror-upload"
 
 
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
 class UploadTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -38,6 +43,14 @@ class UploadTest(unittest.TestCase):
             env={"PATH": f"{self.root}/bin:/usr/bin:/bin:/sbin"},
         )
 
+    def serve(self, folder):
+        handler = partial(QuietHandler, directory=str(folder))
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}"
+
     def calls(self):
         return [line.split()[0] for line in self.log.read_text().splitlines()]
 
@@ -47,7 +60,17 @@ class UploadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
         self.assertIn("omarchy:target has no public URL", result.stdout)
-        # The prune deletes what the stage dropped but never replaces an object.
+        # Unverified, the prune's size check still replaces a short package.
+        self.assertNotIn("--ignore-existing", self.log.read_text().splitlines()[-1])
+
+    def test_a_verified_upload_prunes_without_replacing_packages(self):
+        stage_repo(self.root / "stage", {"a-1-1-x86_64.pkg.tar.zst": b"a"})
+        url = self.serve(self.root / "stage")
+
+        result = self.upload("never", "--url", url)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
         self.assertIn("--ignore-existing", self.log.read_text().splitlines()[-1])
 
     def test_a_failed_database_upload_stops_before_the_prune(self):
@@ -59,13 +82,9 @@ class UploadTest(unittest.TestCase):
     def test_a_package_that_does_not_read_back_stops_before_the_databases(self):
         # The stand-in uploads nothing, so the public URL never has the package.
         stage_repo(self.root / "stage", {"a-1-1-x86_64.pkg.tar.zst": b"a"})
-        handler = partial(SimpleHTTPRequestHandler, directory=str(self.root / "bin"))
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
+        url = self.serve(self.root / "bin")
 
-        result = self.upload("never", "--url", f"http://127.0.0.1:{server.server_port}")
+        result = self.upload("never", "--url", url)
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), ["copy", "copy", "copy"])
