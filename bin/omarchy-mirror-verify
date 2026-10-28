@@ -1,0 +1,214 @@
+#!/bin/bash
+
+# Download every package the staged databases name from the mirror's public
+# URL, the way pacman does, and compare it with the database's SHA-256. R2 has
+# served objects through its custom domain that stop partway through on every
+# read, while the S3 API returns them whole, so only the public path counts.
+# Packages that pass are recorded beside the stage and not read again unless
+# --all is given.
+
+set -euo pipefail
+
+ALL=""
+REPAIR=""
+TIMEOUT=30
+MAX_REPAIR=200
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+  --stage)
+    STAGE="$2"
+    shift 2
+    ;;
+  --r2)
+    R2="$2"
+    shift 2
+    ;;
+  --url)
+    URL="$2"
+    shift 2
+    ;;
+  --all)
+    ALL=true
+    shift
+    ;;
+  --repair)
+    REPAIR=true
+    shift
+    ;;
+  --timeout)
+    TIMEOUT="$2"
+    shift 2
+    ;;
+  --max-repair)
+    MAX_REPAIR="$2"
+    shift 2
+    ;;
+  *)
+    echo "Unknown option: $1"
+    echo "Usage: $0 --stage STAGE --r2 R2 --url URL [--all] [--repair] [--timeout SECONDS] [--max-repair 200]"
+    exit 1
+    ;;
+  esac
+done
+
+: "${STAGE:?--stage is required}" "${R2:?--r2 is required}" "${URL:?--url is required}"
+STAGE="${STAGE%/}"
+URL="${URL%/}"
+# Evidence about one public host says nothing about another's bucket.
+LEDGER="$STAGE.verified.${URL#*://}"
+export LC_ALL=C
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# Every package the staged databases name, as "sha256 key" with the key
+# relative to the stage: what pacman will ask the mirror for. A database that
+# cannot be read, a record without a valid hash or a package missing from the
+# stage fails the run rather than shrinking what is checked.
+python3 - "$STAGE" >"$WORK/manifest.unsorted" <<'PY'
+import io
+import re
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+stage = Path(sys.argv[1])
+databases = sorted(db for db in stage.rglob("*.db") if db.is_file())
+if not databases:
+    sys.exit(f"{stage} has no databases")
+for db in databases:
+    folder = db.parent.relative_to(stage)
+    data = db.read_bytes()
+    # Arch's databases are gzip; others, such as arch-mact2's, are zstd, which
+    # Python's tarfile cannot read before 3.14.
+    if data.startswith(b"\x28\xb5\x2f\xfd"):
+        data = subprocess.run(["zstd", "-dcq"], input=data, stdout=subprocess.PIPE, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        for member in tar:
+            if not member.isfile() or not member.name.endswith("/desc"):
+                continue
+            fields, lines = {}, tar.extractfile(member).read().decode().split("\n")
+            for name, value in zip(lines, lines[1:]):
+                if name.startswith("%") and name.endswith("%"):
+                    fields.setdefault(name.strip("%"), value)
+            filename, digest = fields.get("FILENAME", ""), fields.get("SHA256SUM", "")
+            if not re.fullmatch(r"[0-9a-f]{64}", digest) or not filename or "/" in filename or filename.startswith("."):
+                sys.exit(f"{db}: {member.name} has no valid FILENAME and SHA256SUM")
+            if not (db.parent / filename).is_file():
+                sys.exit(f"{db} names {filename}, which is not in the stage")
+            print(digest, (folder / filename).as_posix())
+PY
+sort -u "$WORK/manifest.unsorted" >"$WORK/manifest"
+
+touch "$LEDGER"
+if [[ -n $ALL ]]; then
+  cp "$WORK/manifest" "$WORK/pending"
+else
+  comm -23 "$WORK/manifest" <(sort -u "$LEDGER") >"$WORK/pending"
+fi
+
+# Download each "sha256 key" in a list from the public URL, sixteen at a time,
+# and sort the lines into good and bad. A query string no one else uses keeps
+# the request out of the cached copy pacman gets. A read that sends nothing for
+# --timeout seconds fails, and nothing resumes it.
+check() {
+  python3 - "$URL" "$TIMEOUT" "$1" "$2" "$3" <<'PY'
+import hashlib
+import secrets
+import sys
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+url, timeout, listed, good, bad = sys.argv[1], float(sys.argv[2]), *sys.argv[3:]
+
+def read(line):
+    digest, key = line.split(" ", 1)
+    request = urllib.request.Request(
+        f"{url}/{urllib.parse.quote(key, safe='/:+@')}?verify={secrets.token_hex(8)}",
+        headers={"User-Agent": "omarchy-mirror-verify", "Accept-Encoding": "identity"},
+    )
+    sha256, size = hashlib.sha256(), 0
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            while chunk := response.read(1 << 20):
+                sha256.update(chunk)
+                size += len(chunk)
+    except Exception as error:
+        return line, f"{key}: {error} after {size} bytes"
+    if sha256.hexdigest() != digest:
+        return line, f"{key}: SHA-256 differs after {size} bytes"
+    return line, None
+
+lines = open(listed).read().splitlines()
+with ThreadPoolExecutor(16) as pool, open(good, "w") as passed, open(bad, "w") as failed:
+    for line, problem in pool.map(read, lines):
+        if problem:
+            print(problem, file=sys.stderr)
+            failed.write(line + "\n")
+        else:
+            passed.write(line + "\n")
+PY
+}
+
+pending=$(( $(wc -l <"$WORK/pending") ))
+echo "Verify $pending of $(( $(wc -l <"$WORK/manifest") )) packages at $URL"
+: >"$WORK/good"
+: >"$WORK/bad"
+if (( pending > 0 )); then
+  check "$WORK/pending" "$WORK/good" "$WORK/bad"
+fi
+
+# Too many failures means something other than a few broken objects, such as
+# the network: re-uploading all of it would hide that. A package is uploaded
+# again only from a stage copy that matches its database.
+failed=$(( $(wc -l <"$WORK/bad") ))
+if (( failed > 0 )) && [[ -n $REPAIR ]]; then
+  if (( failed > MAX_REPAIR )); then
+    echo "Not re-uploading $failed packages (more than --max-repair $MAX_REPAIR)" >&2
+  elif ! python3 - "$STAGE" "$WORK/bad" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+stage, listed = Path(sys.argv[1]), sys.argv[2]
+for line in open(listed).read().splitlines():
+    digest, key = line.split(" ", 1)
+    sha256 = hashlib.sha256()
+    with open(stage / key, "rb") as package:
+        while chunk := package.read(1 << 20):
+            sha256.update(chunk)
+    if sha256.hexdigest() != digest:
+        sys.exit(f"{key}: the stage's copy differs from its database")
+PY
+  then
+    echo "Not re-uploading: the stage's copy differs from its database" >&2
+  else
+    echo "Re-upload $failed packages that did not read back"
+    cut -d' ' -f2- "$WORK/bad" >"$WORK/bad.keys"
+    rclone copy "$STAGE" "$R2" --files-from "$WORK/bad.keys" --no-traverse --ignore-times
+    check "$WORK/bad" "$WORK/repaired" "$WORK/still-bad"
+    cat "$WORK/repaired" >>"$WORK/good"
+    mv "$WORK/still-bad" "$WORK/bad"
+  fi
+fi
+
+# Record what passed, even when something else failed, so the next run reads
+# only what is still unproven. Entries the databases no longer name drop out,
+# and with --all so does anything that failed this time.
+if [[ -n $ALL ]]; then
+  sort -u "$WORK/good" >"$LEDGER.new"
+else
+  sort -u <(comm -12 "$WORK/manifest" <(sort -u "$LEDGER")) "$WORK/good" >"$LEDGER.new"
+fi
+mv "$LEDGER.new" "$LEDGER"
+
+if [[ -s $WORK/bad ]]; then
+  echo "These packages do not read back from $URL with their database's SHA-256:" >&2
+  cut -d' ' -f2- "$WORK/bad" >&2
+  exit 1
+else
+  echo "Every package the databases name reads back from $URL"
+fi
