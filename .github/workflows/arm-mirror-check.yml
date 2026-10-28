@@ -51,12 +51,23 @@ jobs:
           pacman-key --init
           pacman-key --populate archlinuxarm
 
+      # Edge syncs hourly, so a stamp more than three hours old means the sync
+      # has stopped: from 2026-10-25 every hourly run failed, and this step went
+      # on printing the age for 3.8 days. rc and stable are snapshots that move
+      # only at a release, so their age is only printed.
       - name: Freshness
         run: |
+          stale=0
           for repo in core extra alarm aur; do
             stamp=$(curl -fsS "https://${{ matrix.host }}.omarchy.org/aarch64/$repo/lastsync")
-            echo "$repo: checked $(( ($(date +%s) - stamp) / 60 )) minutes ago"
+            age=$(( ($(date +%s) - stamp) / 60 ))
+            echo "$repo: checked $age minutes ago"
+            if [ "${{ matrix.host }}" = arm-mirror ] && [ "$age" -gt 180 ]; then
+              echo "::error::edge $repo was last synced $age minutes ago; the hourly sync has stopped"
+              stale=1
+            fi
           done
+          [ "$stale" -eq 0 ]
 
       - name: Full system upgrade
         run: pacman -Syyu --noconfirm
