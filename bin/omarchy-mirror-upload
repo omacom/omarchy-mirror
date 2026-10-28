@@ -74,10 +74,11 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
   --transfers=4 \
   --include '**/*.db*' --include '**/*.files*' --include '/lastsync' --include '/lastupdate'
 
-# 3) Prune anything no longer present upstream (safe after DB update)
+# 3) Prune anything no longer present upstream (safe after DB update). It never
+# replaces an object that exists: what step 1c read back stays as it was read.
 echo "Prune removed packages on R2"
 rclone sync "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
-  --size-only --no-update-modtime \
+  --ignore-existing --size-only --no-update-modtime \
   --checkers=128 --transfers=16 \
   --exclude '**/*.db*' --exclude '**/*.files*' --exclude '/lastsync' --exclude '/lastupdate'
 

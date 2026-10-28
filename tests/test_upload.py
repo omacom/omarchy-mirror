@@ -47,6 +47,8 @@ class UploadTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
         self.assertIn("omarchy:target has no public URL", result.stdout)
+        # The prune deletes what the stage dropped but never replaces an object.
+        self.assertIn("--ignore-existing", self.log.read_text().splitlines()[-1])
 
     def test_a_failed_database_upload_stops_before_the_prune(self):
         result = self.upload(failing_step="--include **/*.db*")
