@@ -1,3 +1,4 @@
 # All-NUL records in Arch Linux ARM's .db databases, recovered from the exact
 # matching .files record. One ARCH/REPO/MEMBER per line.
 aarch64/extra/findnewest-0.3-4/desc
+aarch64/extra/lua53-lanes-4.0.0-3/desc
