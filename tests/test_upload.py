@@ -32,6 +32,8 @@ class UploadTest(unittest.TestCase):
         rclone.write_text(
             "#!/bin/bash\n"
             f'echo "$1 $*" >> "{self.log}"\n'
+            # The purge's listings of the bucket: empty, so nothing was replaced.
+            '[[ $1 == lsjson ]] && { echo "[]"; exit 0; }\n'
             f'[[ "$*" == *"{failing_step}"* ]] && exit 1\n'
             "exit 0\n"
         )
@@ -40,7 +42,7 @@ class UploadTest(unittest.TestCase):
             [str(UPLOAD), "--stage", f"{self.root}/stage/", "--r2", "omarchy:target", *args],
             capture_output=True,
             text=True,
-            env={"PATH": f"{self.root}/bin:/usr/bin:/bin:/sbin"},
+            env={"PATH": f"{self.root}/bin:/usr/bin:/bin:/sbin", "OMARCHY_MIRROR_STATE": f"{self.root}/state"},
         )
 
     def serve(self, folder):
@@ -70,7 +72,8 @@ class UploadTest(unittest.TestCase):
         result = self.upload("never", "--url", url)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
+        # The bucket is listed before the upload and again before the databases.
+        self.assertEqual(self.calls(), ["lsjson", "copy", "copy", "lsjson", "copy", "sync"])
         self.assertIn("--ignore-existing", self.log.read_text().splitlines()[-1])
 
     def test_a_failed_database_upload_stops_before_the_prune(self):
@@ -87,8 +90,9 @@ class UploadTest(unittest.TestCase):
         result = self.upload("never", "--url", url)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.calls(), ["copy", "copy", "copy"])
-        self.assertIn("--files-from", self.log.read_text().splitlines()[2])
+        # The repair lists the bucket around its re-upload, to purge what it wrote.
+        self.assertEqual(self.calls(), ["lsjson", "copy", "copy", "lsjson", "copy", "lsjson"])
+        self.assertIn("--files-from", self.log.read_text().splitlines()[4])
         self.assertNotIn("--include **/*.db*", self.log.read_text())
         self.assertIn("core/os/x86_64/a-1-1-x86_64.pkg.tar.zst", result.stderr)
 

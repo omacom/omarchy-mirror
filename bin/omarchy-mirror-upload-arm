@@ -6,6 +6,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VERBOSE_RCLONE=""
 
 while [[ $# -gt 0 ]]; do
@@ -102,9 +103,25 @@ else
   PACKAGE_CHANGED=(--update --use-server-modtime)
 fi
 
+# Step 1 replaces a package when upstream rebuilds it under the same name, as
+# Arch Linux ARM did with python-protobuf-36.1-1 on November 8, 2026, and
+# Cloudflare keeps every cached package for a year. So R2's listing is taken
+# first, and what step 1 wrote again is purged before the databases go up.
+URL=$(awk -v r2="$R2" '$1 == r2 { print $2 }' "${OMARCHY_MIRROR_PUBLIC_URLS:-$SCRIPT_DIR/../config/public-urls}")
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" begin --r2 "$R2" --url "$URL"
+else
+  echo "$R2 has no public URL in config/public-urls: nothing is purged from a cache"
+fi
+
 # 1) Packages and signatures (no deletes)
 echo "Upload packages from $STAGE to $R2"
 rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@]}"
+
+# 1b) The cache must serve what R2 holds before a database names it
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" finish --r2 "$R2" --url "$URL"
+fi
 
 # 2) Publish db/files, now that every package they name is there
 echo "Upload db/files from $STAGE to $R2"
@@ -114,8 +131,19 @@ rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${INDEX[@]}"
 echo "Upload lastsync from $STAGE to $R2"
 rclone copy "$STAGE" "$R2" "${COMMON[@]}" "${INDEX_CHANGED[@]}" "${STAMPS[@]}"
 
-# 4) Prune what is no longer in the stage (safe after the databases)
+# 4) Prune what is no longer in the stage (safe after the databases). It
+# copies too: a promote's source can rebuild a package while it runs, so what
+# it writes is purged as well. It leaves the databases and stamps alone, so a
+# database that changed at the source meanwhile never goes up ahead of that
+# purge: omarchy-mirror-promote-arm sees the change and copies again, through
+# steps 1 to 3. A database the stage no longer has stays on R2.
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" begin --r2 "$R2" --url "$URL"
+fi
 echo "Prune removed files on $R2"
-rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}"
+rclone sync "$STAGE" "$R2" "${COMMON[@]}" "${PACKAGE_CHANGED[@]}" "${NOT_INDEX[@]}"
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" finish --r2 "$R2" --url "$URL"
+fi
 
 echo "Finished uploading Arch Linux ARM mirror in ${SECONDS}s"

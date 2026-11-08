@@ -137,7 +137,8 @@ class SyncArmTest(unittest.TestCase):
         for script in ("omarchy-mirror-sync-arm", "omarchy-mirror-upload-arm"):
             shutil.copy(BIN / script, self.root / "bin")
         (self.root / "config").mkdir()
-        for allow in ("arm-allow-files-only", "arm-allow-null-records"):
+        # No public URL for this bucket: nothing to purge.
+        for allow in ("arm-allow-files-only", "arm-allow-null-records", "public-urls"):
             (self.root / "config" / allow).write_text("")
         # The stager's part of a run: every repository staged with the run's
         # stamp, and the report upload-arm requires.

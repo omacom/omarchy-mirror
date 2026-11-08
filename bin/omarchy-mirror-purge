@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Purge from Cloudflare's cache every package an upload replaced in a bucket.
+
+Cloudflare keeps a mirror's packages and signatures for a year. When a file is
+replaced under the same name, as Arch Linux ARM does when it rebuilds a
+package without a new pkgrel, every data center that cached the old bytes
+keeps serving them. pacman then reads a new database that names the new size
+and checksum, and fails with "Maximum file size exceeded" or a checksum error.
+
+    omarchy-mirror-purge begin  --r2 R2 --url URL
+    omarchy-mirror-purge finish --r2 R2 --url URL
+    omarchy-mirror-purge keys   --r2 R2 --url URL --files-from KEYS
+
+`begin` lists the bucket's packages and signatures with the time R2 stored
+each one. `finish`, run before the databases go up, lists them again: a key
+that was there before and now has another size or time was written again. It
+purges those URLs, then downloads each one through the cache, the way pacman
+does, and compares it with the bucket's copy. Only then may the databases go
+up; a failure exits 1 and keeps the list, so the next run purges it again.
+`keys` purges and checks a given list of keys, for a repair outside an upload.
+
+rclone cannot tell the replacements apart by itself: a server-side copy, which
+omarchy-mirror-promote-arm makes, logs the same line for a new object and a
+replaced one. The bucket's own listing is the same for every path that writes.
+
+The token comes from CLOUDFLARE_PURGE_TOKEN, or else from the same line in
+/etc/omarchy-mirror/cloudflare.env (mode 600), so the hourly timers and the
+release-day runs started by hand both find it. It needs Cache Purge on the
+zone in config/cloudflare-zone and nothing else. A run that replaced nothing
+needs no token.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+# Packages and their detached signatures: what the cache rules keep for a year.
+CACHED = re.compile(r"\.pkg\.tar\.[a-z0-9]+(\.sig)?$")
+API = os.environ.get("CLOUDFLARE_API", "https://api.cloudflare.com/client/v4")
+STATE = Path(os.environ.get("OMARCHY_MIRROR_STATE", "/var/lib/omarchy-mirror")) / "purge"
+TOKEN_FILE = Path(os.environ.get("CLOUDFLARE_PURGE_ENV", "/etc/omarchy-mirror/cloudflare.env"))
+# Cloudflare takes at most 100 URLs in one purge request.
+BATCH = 100
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def listing(r2):
+    """key -> [size, time R2 stored it] for every package and signature."""
+    out = subprocess.run(
+        ["rclone", "lsjson", "--recursive", "--files-only", "--fast-list", "--no-mimetype",
+         "--use-server-modtime", r2],
+        stdout=subprocess.PIPE, check=True, text=True,
+    ).stdout
+    return {o["Path"]: [o["Size"], o["ModTime"]] for o in json.loads(out) if CACHED.search(o["Path"])}
+
+
+def token():
+    if "CLOUDFLARE_PURGE_TOKEN" in os.environ:
+        return os.environ["CLOUDFLARE_PURGE_TOKEN"].strip()
+    try:
+        lines = TOKEN_FILE.read_text().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        name, _, value = line.partition("=")
+        if name.strip() == "CLOUDFLARE_PURGE_TOKEN":
+            return value.strip().strip("'\"")
+    return ""
+
+
+def baseline_path(r2, name=""):
+    """One list per bucket and per writer: verify's repairs keep their own, so
+    a repair inside an upload neither finishes nor loses the upload's."""
+    return STATE / (re.sub(r"[^A-Za-z0-9._-]", "_", r2.rstrip("/")) + (f".{name}" if name else "") + ".json")
+
+
+def urls(base, key):
+    """The URLs a key's cached copy can sit under. pacman asks for ':' and '+'
+    as they are; a client that percent-encodes them gets a separate entry."""
+    raw = f"{base}/{urllib.parse.quote(key, safe='/:+@~!$&*,;=')}"
+    encoded = f"{base}/{urllib.parse.quote(key, safe='/~')}"
+    return [raw] if raw == encoded else [raw, encoded]
+
+
+def purge(zone, token, files):
+    """Purge files (URLs), 100 to a request. A new or briefly unavailable API
+    answers with an error that a retry clears, so each request gets five."""
+    for start in range(0, len(files), BATCH):
+        body = json.dumps({"files": files[start:start + BATCH]}).encode()
+        for attempt in range(5):
+            request = urllib.request.Request(
+                f"{API}/zones/{zone}/purge_cache", body, method="POST",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                         "User-Agent": "omarchy-mirror-purge"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    answer = json.load(response)
+            except urllib.error.HTTPError as error:
+                answer = {"success": False, "errors": [f"HTTP {error.code}: {error.read(300)!r}"]}
+            except (urllib.error.URLError, OSError, ValueError) as error:
+                answer = {"success": False, "errors": [str(error)]}
+            if answer.get("success"):
+                break
+            if attempt == 4:
+                raise SystemExit(f"Cloudflare refused the purge: {answer.get('errors')}")
+            time.sleep(2 * (attempt + 1))
+
+
+def md5s(r2, keys):
+    """The bucket's MD5 of each key, read from the objects themselves: a
+    multipart object's listed checksum is not its content's."""
+    with tempfile.NamedTemporaryFile("w", suffix=".keys") as listed:
+        listed.write("".join(f"{key}\n" for key in keys))
+        listed.flush()
+        out = subprocess.run(
+            ["rclone", "md5sum", "--download", "--files-from", listed.name, r2],
+            stdout=subprocess.PIPE, check=True, text=True,
+        ).stdout
+    sums = {}
+    for line in out.splitlines():
+        digest, key = line.split("  ", 1)
+        sums[key] = digest
+    return sums
+
+
+def served(url, timeout):
+    """MD5 of what the cache serves at url, as pacman would get it."""
+    request = urllib.request.Request(url, headers={"User-Agent": "omarchy-mirror-purge",
+                                                   "Accept-Encoding": "identity"})
+    digest = hashlib.md5()
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        while True:
+            chunk = response.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def begin(args):
+    path = baseline_path(args.r2, args.list)
+    now = listing(args.r2)
+    if path.exists():
+        # A run that failed after replacing something left its list: keep its
+        # entries, so what it replaced is still purged, and add the keys it
+        # uploaded new, which may be cached by now and replaced in this run.
+        log(f"Keep the list from an unfinished run: {path}")
+        kept = json.loads(path.read_text())
+        now.update(kept)
+    STATE.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(now))
+    tmp.replace(path)
+
+
+def finish(args):
+    path = baseline_path(args.r2, args.list)
+    if not path.exists():
+        if args.pending_only:
+            return
+        raise SystemExit(f"No list from before the upload ({path}): run begin first")
+    before, now = json.loads(path.read_text()), listing(args.r2)
+    replaced = sorted(key for key, stat in before.items() if key in now and now[key] != stat)
+    if not replaced:
+        log(f"No package or signature on {args.r2} was replaced")
+        path.unlink()
+        return
+    log(f"{len(replaced)} packages or signatures on {args.r2} were replaced, e.g. {replaced[0]}")
+    clear(args, replaced)
+    path.unlink()
+
+
+def keys(args):
+    """Purge and check the keys listed in --files-from: a repair that knows
+    what it wrote, outside an upload."""
+    listed = sorted(set(Path(args.files_from).read_text().split()))
+    if listed:
+        clear(args, listed)
+
+
+def clear(args, replaced):
+    """Purge replaced from the cache, then read each one through it until it
+    matches the bucket. Exit 1 if it never does."""
+    secret = token()
+    if not secret:
+        raise SystemExit(f"No CLOUDFLARE_PURGE_TOKEN in the environment or {TOKEN_FILE}: "
+                         "the cache would keep the old bytes")
+    zone = os.environ.get("CLOUDFLARE_ZONE_ID") or (ROOT / "config/cloudflare-zone").read_text().split()[0]
+    base = args.url.rstrip("/")
+    expected = md5s(args.r2, replaced)
+    missing = [key for key in replaced if key not in expected]
+    if missing:
+        raise SystemExit(f"{args.r2} has no checksum for {missing[0]}")
+
+    files = [url for key in replaced for url in urls(base, key)]
+    left = replaced
+    for attempt in range(args.attempts):
+        purge(zone, secret, files if attempt == 0 else [u for key in left for u in urls(base, key)])
+        log(f"Purged {len(left)} keys from the cache at {base}")
+        wrong = []
+        for key in left:
+            try:
+                got = served(urls(base, key)[0], args.timeout)
+            except Exception as error:  # a failed read proves nothing either way
+                got = f"no copy ({error})"
+            if got != expected[key]:
+                wrong.append((key, got))
+        left = [key for key, _ in wrong]
+        if not left:
+            break
+        log(f"{len(left)} still differ from the bucket, e.g. {wrong[0][0]}: {wrong[0][1]}")
+        time.sleep(args.wait)
+    if left:
+        raise SystemExit(f"The cache at {base} still serves other bytes than {args.r2} for: {', '.join(left)}")
+    log(f"The cache at {base} serves the bucket's copy of every replaced key")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("step", choices=["begin", "finish", "keys"])
+    parser.add_argument("--r2", required=True, help="the bucket, as remote:bucket")
+    parser.add_argument("--url", required=True, help="the public URL the cache serves the bucket at")
+    parser.add_argument("--timeout", type=float, default=60, help="seconds a read may stall")
+    parser.add_argument("--attempts", type=int, default=3, help="purges before giving up")
+    parser.add_argument("--wait", type=float, default=10, help="seconds between attempts")
+    parser.add_argument("--files-from", help="keys step: a file of bucket keys, one a line")
+    parser.add_argument("--list", default="", help="name of the list, for a writer other than the upload")
+    parser.add_argument("--pending-only", action="store_true",
+                        help="finish: do nothing when no list is pending, instead of failing")
+    args = parser.parse_args()
+    if args.step == "keys" and not args.files_from:
+        parser.error("keys needs --files-from")
+    {"begin": begin, "finish": finish, "keys": keys}[args.step](args)
+
+
+if __name__ == "__main__":
+    main()

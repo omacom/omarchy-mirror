@@ -61,6 +61,16 @@ export LC_ALL=C
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+PURGE="$(dirname -- "${BASH_SOURCE[0]}")/omarchy-mirror-purge"
+
+# A repair whose purge failed left its list: its packages read back whole
+# with the query string below, so only this finds them again. If it fails
+# again, this run still repairs what it finds, and then fails.
+PURGED=true
+if ! "$PURGE" finish --list repair --pending-only --r2 "$R2" --url "$URL"; then
+  echo "A purge left by an earlier repair still fails at $URL" >&2
+  PURGED=""
+fi
 
 # Every package the staged databases name, as "sha256 key" with the key
 # relative to the stage: what pacman will ask the mirror for. A database that
@@ -202,9 +212,20 @@ PY
   else
     echo "Re-upload $failed packages that did not read back"
     cut -d' ' -f2- "$WORK/bad" >"$WORK/bad.keys"
+    # The re-uploaded packages may be cached as the broken copy pacman got,
+    # so what the re-upload writes is purged. A purge that fails keeps its
+    # list for the next run and stops this one, so nothing publishes.
+    "$PURGE" begin --list repair --r2 "$R2" --url "$URL"
     # A failed upload is not the end: the read below decides what is still bad.
     if ! rclone copy "$STAGE" "$R2" --files-from "$WORK/bad.keys" --no-traverse --ignore-times; then
       echo "Re-upload failed for some packages" >&2
+    fi
+    # Its list holds an earlier failed one's too, so a success clears both.
+    if "$PURGE" finish --list repair --r2 "$R2" --url "$URL"; then
+      PURGED=true
+    else
+      echo "The re-uploaded packages could not be purged from the cache at $URL" >&2
+      exit 1
     fi
     check "$WORK/bad" "$WORK/repaired" "$WORK/still-bad"
     cat "$WORK/repaired" >>"$WORK/good"
@@ -216,6 +237,9 @@ fi
 if [[ -s $WORK/bad ]]; then
   echo "These packages do not read back from $URL with their database's SHA-256:" >&2
   cut -d' ' -f2- "$WORK/bad" >&2
+  exit 1
+elif [[ -z $PURGED ]]; then
+  echo "Repaired packages may still be cached as the old bytes at $URL: not publishing" >&2
   exit 1
 else
   echo "Every package the databases name reads back from $URL"

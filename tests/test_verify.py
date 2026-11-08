@@ -3,6 +3,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -56,6 +57,16 @@ class Bucket(SimpleHTTPRequestHandler):
         self.wfile.flush()
         time.sleep(10)
 
+    def do_POST(self):
+        # Cloudflare's purge API, for the packages a repair re-uploads.
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.requests.append(("purge", json.loads(body)["files"]))
+        data = b'{"success": true}'
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, *args):
         pass
 
@@ -84,13 +95,17 @@ class VerifyTest(unittest.TestCase):
         self.ledger = Path(f"{self.stage}.verified.{self.host}")
 
     def verify(self, *args, env=None):
+        # This server is also the purge API a repair calls.
+        purge = {"CLOUDFLARE_API": f"http://{self.host}", "CLOUDFLARE_ZONE_ID": "zone",
+                 "CLOUDFLARE_PURGE_TOKEN": "test-token", "OMARCHY_MIRROR_STATE": str(self.root / "state"),
+                 "CLOUDFLARE_PURGE_ENV": str(self.root / "no-such.env")}
         return subprocess.run(
             [str(VERIFY), "--stage", f"{self.stage}/", "--r2", str(self.bucket),
              "--url", f"http://{self.host}/", "--timeout", "2", *args],
             capture_output=True,
             text=True,
             timeout=120,
-            env=env,
+            env={**os.environ, **purge, **(env or {})},
         )
 
     def recorded(self):
@@ -169,6 +184,9 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(broken.read_bytes(), self.packages["a-1-1-x86_64.pkg.tar.zst"])
         self.assertEqual(len(self.recorded()), 2)
+        # The cache may hold the broken copy pacman got: the repair purges it.
+        purged = [files for entry in self.requests if entry[0] == "purge" for files in entry[1]]
+        self.assertEqual(purged, [f"http://{self.host}/core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"])
 
     def test_a_failed_re_upload_does_not_keep_a_broken_package_recorded(self):
         self.assertEqual(self.verify().returncode, 0)
@@ -182,6 +200,37 @@ class VerifyTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.recorded(), ["core/os/x86_64/b-1-1-x86_64.pkg.tar.zst"])
+
+    @unittest.skipUnless(RCLONE, "needs rclone")
+    def test_a_repair_whose_purge_failed_is_purged_by_the_next_run(self):
+        broken = self.bucket / "core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"
+        broken.write_bytes(b"x" * 200_000)
+
+        failed = self.verify("--all", "--repair", env={"CLOUDFLARE_PURGE_TOKEN": ""})
+
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(broken.read_bytes(), self.packages["a-1-1-x86_64.pkg.tar.zst"], "R2 is repaired")
+        self.requests.clear()
+
+        # The package now reads back whole, so nothing is repaired again: the
+        # purge left over from the failed run must still happen.
+        result = self.verify("--all", "--repair")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        purged = [files for entry in self.requests if entry[0] == "purge" for files in entry[1]]
+        self.assertEqual(purged, [f"http://{self.host}/core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"])
+
+    @unittest.skipUnless(RCLONE, "needs rclone")
+    def test_a_purge_that_keeps_failing_does_not_stop_later_repairs(self):
+        broken = self.bucket / "core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"
+        broken.write_bytes(b"x" * 200_000)
+        self.assertEqual(self.verify("--all", "--repair", env={"CLOUDFLARE_PURGE_TOKEN": ""}).returncode, 1)
+        broken.write_bytes(b"y" * 200_000)
+
+        result = self.verify("--all", "--repair", env={"CLOUDFLARE_PURGE_TOKEN": ""})
+
+        self.assertEqual(result.returncode, 1, "the purge still fails, so nothing publishes")
+        self.assertEqual(broken.read_bytes(), self.packages["a-1-1-x86_64.pkg.tar.zst"], "but the repair ran")
 
     def test_repair_refuses_more_than_max_repair(self):
         broken = self.bucket / "core/os/x86_64/a-1-1-x86_64.pkg.tar.zst"

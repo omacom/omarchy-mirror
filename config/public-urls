@@ -1,6 +1,10 @@
 # The public URL pacman reads each bucket through. omarchy-mirror-upload reads
 # every new package back from it before publishing the databases; a bucket not
-# listed here is not checked.
+# listed here is not checked. Both uploads purge what they replace from the
+# cache at this URL (omarchy-mirror-purge).
 omarchy:omarchy-mirror https://mirror.omarchy.org
 omarchy:omarchy-mirror-rc https://rc-mirror.omarchy.org
 omarchy:omarchy-mirror-stable https://stable-mirror.omarchy.org
+omarchy:omarchy-mirror-arm https://arm-mirror.omarchy.org
+omarchy:omarchy-mirror-arm-rc https://arm-rc-mirror.omarchy.org
+omarchy:omarchy-mirror-arm-stable https://arm-stable-mirror.omarchy.org

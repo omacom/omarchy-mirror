@@ -38,6 +38,16 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z $URL ]]; then
+  URL=$(awk -v r2="$R2" '$1 == r2 { print $2 }' "${OMARCHY_MIRROR_PUBLIC_URLS:-$SCRIPT_DIR/../config/public-urls}")
+fi
+
+# What R2 holds now, so the step before the databases can tell which packages
+# and signatures this run wrote again and purge them from Cloudflare's cache.
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" begin --r2 "$R2" --url "$URL"
+fi
+
 # 1) Add/refresh packages only (no deletes)
 echo "Upload packages from stage to R2 (additive)"
 rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE \
@@ -58,9 +68,6 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE \
 # uses, before publishing them. R2 has served objects there that stop partway
 # through, and step 1 never replaces an object that exists, so a broken one is
 # re-uploaded here or stops the run.
-if [[ -z $URL ]]; then
-  URL=$(awk -v r2="$R2" '$1 == r2 { print $2 }' "$SCRIPT_DIR/../config/public-urls")
-fi
 if [[ -n $URL ]]; then
   echo "Verify packages at $URL against the staged databases"
   "$SCRIPT_DIR/omarchy-mirror-verify" --stage "$STAGE" --r2 "$R2" --url "$URL" --repair
@@ -70,6 +77,13 @@ else
   echo "$R2 has no public URL in config/public-urls: packages are not read back"
   # The prune's size check is then the only repair for a short package.
   KEEP_VERIFIED=""
+fi
+
+# 1d) A package or signature written again (a repair above, a changed .sig)
+# can still be cached at Cloudflare as the old bytes, for up to a year. The
+# databases go up only once the cache serves what R2 holds.
+if [[ -n $URL ]]; then
+  "$SCRIPT_DIR/omarchy-mirror-purge" finish --r2 "$R2" --url "$URL"
 fi
 
 # 2) Publish db/files + freshness markers
