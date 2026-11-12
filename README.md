@@ -22,6 +22,16 @@ bin/omarchy-mirror-sync-stable-from-rc
 
 Snapshots only move forward, from upstream to rc to stable, and stable never syncs from upstream itself. A patch release candidate leaves the mirrors alone: since the last release, rc and stable serve the same snapshot. The copy to stable refuses to move it to an older snapshot than it serves.
 
+A security fix that can't wait for the next release is backported into the frozen snapshot, one package at a time, from the edge stage: rc first, then stable from rc as on release day, so the two stay identical.
+
+```sh
+bin/omarchy-mirror-backport --from /mnt/arch-mirror/ --to /mnt/arch-mirror-rc/ \
+  --repo core --package ca-certificates-mozilla --r2 omarchy:omarchy-mirror-rc
+bin/omarchy-mirror-sync-stable-from-rc
+```
+
+It swaps the package's entries in the databases for upstream's own, so pacman checks the same checksum and packager signature as on Arch, and leaves the rest of the snapshot and its `lastsync` alone. It only replaces a package the snapshot already has, and only from a newer snapshot. Each backport is listed in `/backports` on the mirror until the next snapshot from upstream replaces it.
+
 Promote the mirror before the packages. `stable-mirror.omarchy.org/lastsync` matches `rc-mirror.omarchy.org/lastsync` once the copy is up, and only then should stable packages be promoted. Stable packages built against the new snapshot would otherwise reach machines that still get the old one.
 
 ## Arch Linux ARM: local HTTP staging
