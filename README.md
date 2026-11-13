@@ -20,7 +20,7 @@ bin/omarchy-mirror-sync-rc
 bin/omarchy-mirror-sync-stable-from-rc
 ```
 
-Snapshots only move forward, from upstream to rc to stable, and stable never syncs from upstream itself. A patch release candidate leaves the mirrors alone: since the last release, rc and stable serve the same snapshot. The copy to stable refuses to move it to an older snapshot than it serves.
+Snapshots only move forward, from upstream to rc to stable, and stable never syncs from upstream itself. A patch release candidate leaves the mirrors alone: since the last release, rc and stable serve the same snapshot. The copy to stable refuses to move it to an older snapshot than it serves, and to move any package back to an older version than it serves, which a backport can make the newer one in the same snapshot. `bin/omarchy-mirror-backwards` lists those packages, comparing versions as pacman's `vercmp` does.
 
 A security fix that can't wait for the next release is backported into the frozen snapshot, one package at a time, from the edge stage: rc first, then stable from rc as on release day, so the two stay identical.
 

@@ -7,7 +7,8 @@
 # It refuses a source stage without a snapshot, which rsync --delete would
 # publish as an empty mirror, one missing a repository the target serves, which
 # would delete it there and on R2, and a copy that would move the target back to
-# an older snapshot than the one its machines already run, or that can't tell.
+# an older snapshot than the one its machines already run, or any package back
+# to an older version than it serves, or that can't tell.
 set -euo pipefail
 
 usage="Usage: $0 --from STAGE --to STAGE --r2 R2"
@@ -66,5 +67,19 @@ if [[ -n $to_sync ]] && ((to_sync > from_sync)); then
 fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# lastsync says which snapshot a stage holds, not what was backported into it
+# since. A copy between equal snapshots, stable over rc to repair it, say,
+# would otherwise put a backported package back to its old version.
+if ! back=$("$SCRIPT_DIR/omarchy-mirror-backwards" "$FROM" "$TO"); then
+  if [[ -n $back ]]; then
+    echo "$TO serves newer versions than $FROM of these, so it is not copied over:" >&2
+    echo "$back" >&2
+  else
+    echo "$FROM's and $TO's package versions can't be compared, so it is not copied over" >&2
+  fi
+  exit 1
+fi
+
 rsync -a --delete "$FROM" "$TO"
 "$SCRIPT_DIR/omarchy-mirror-upload" --stage "$TO" --r2 "$R2"
