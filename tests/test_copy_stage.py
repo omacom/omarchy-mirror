@@ -107,6 +107,18 @@ class CopyStageTest(unittest.TestCase):
         self.assertEqual(self.packages(rc), ["glibc-2.43-2-x86_64.pkg.tar.zst"])
         self.assertEqual(self.uploads(), [])
 
+    def test_waits_for_an_unfinished_backport(self):
+        rc = self.stage("rc", RC_SYNC, 2)
+        stable = self.stage("stable", RC_SYNC, 1)
+        (self.root / "stable.backport-pending").mkdir()
+
+        result = self.copy(rc, stable)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfinished backport", result.stderr)
+        self.assertEqual(self.packages(stable), ["glibc-2.43-1-x86_64.pkg.tar.zst"])
+        self.assertEqual(self.uploads(), [])
+
     def test_refuses_databases_it_cannot_compare(self):
         stable = self.stage("stable", STABLE_SYNC, 2)
         rc = self.stage("rc", RC_SYNC, 1)
