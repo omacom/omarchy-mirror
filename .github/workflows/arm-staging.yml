@@ -8,6 +8,8 @@ on:
       - bin/omarchy-mirror-upload-arm
       - bin/omarchy-mirror-promote-arm
       - bin/omarchy-mirror-copy-stage
+      - bin/omarchy-mirror-backport
+      - bin/omarchy-mirror-backwards
       - bin/omarchy-mirror-upload
       - tests/**
       - .github/workflows/arm-staging.yml
@@ -18,6 +20,8 @@ on:
       - bin/omarchy-mirror-upload-arm
       - bin/omarchy-mirror-promote-arm
       - bin/omarchy-mirror-copy-stage
+      - bin/omarchy-mirror-backport
+      - bin/omarchy-mirror-backwards
       - bin/omarchy-mirror-upload
       - tests/**
       - .github/workflows/arm-staging.yml

@@ -1,7 +1,9 @@
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -17,14 +19,27 @@ class CopyStageTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         (self.root / "bin").mkdir()
         shutil.copy(BIN / "omarchy-mirror-copy-stage", self.root / "bin")
+        shutil.copy(BIN / "omarchy-mirror-backwards", self.root / "bin")
         upload = self.root / "bin/omarchy-mirror-upload"
         upload.write_text('#!/bin/bash\necho "$*" >> "$(dirname "$0")/../uploads"\n')
         upload.chmod(0o755)
 
+    @staticmethod
+    def database(path, packages):
+        """A pacman database listing each (name, version)."""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            for name, version in packages:
+                data = f"%NAME%\n{name}\n\n%VERSION%\n{version}\n\n".encode()
+                info = tarfile.TarInfo(f"{name}-{version}/desc")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        path.write_bytes(buffer.getvalue())
+
     def stage(self, name, lastsync, release):
         repo = self.root / name / "core/os/x86_64"
         repo.mkdir(parents=True)
-        (repo / "core.db").write_text(f"{name} database\n")
+        self.database(repo / "core.db", [("glibc", f"2.43-{release}")])
         (repo / f"glibc-2.43-{release}-x86_64.pkg.tar.zst").touch()
         (self.root / name / "lastsync").write_text(f"{lastsync}\n")
         # Upstream's mtimes come along with every sync, so stages differ in them.
@@ -54,7 +69,7 @@ class CopyStageTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((rc / "lastsync").read_text(), f"{STABLE_SYNC}\n")
-        self.assertEqual((rc / "core/os/x86_64/core.db").read_text(), "stable database\n")
+        self.assertEqual((rc / "core/os/x86_64/core.db").read_bytes(), (stable / "core/os/x86_64/core.db").read_bytes())
         self.assertEqual(self.packages(rc), ["glibc-2.43-2-x86_64.pkg.tar.zst"])
         self.assertEqual(self.uploads(), [f"--stage {rc}/ --r2 omarchy:target"])
 
@@ -77,6 +92,43 @@ class CopyStageTest(unittest.TestCase):
         self.assertIn(f"newer snapshot ({STABLE_SYNC})", result.stderr)
         self.assertEqual((stable / "lastsync").read_text(), f"{STABLE_SYNC}\n")
         self.assertEqual(self.packages(stable), ["glibc-2.43-2-x86_64.pkg.tar.zst"])
+        self.assertEqual(self.uploads(), [])
+
+    def test_never_moves_a_backported_package_back(self):
+        # rc has glibc 2.43-2 backported into the snapshot stable also serves;
+        # copying stable over rc to repair it must not put 2.43-1 back.
+        stable = self.stage("stable", STABLE_SYNC, 1)
+        rc = self.stage("rc", STABLE_SYNC, 2)
+
+        result = self.copy(stable, rc)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("core glibc 2.43-2 -> 2.43-1", result.stderr)
+        self.assertEqual(self.packages(rc), ["glibc-2.43-2-x86_64.pkg.tar.zst"])
+        self.assertEqual(self.uploads(), [])
+
+    def test_waits_for_an_unfinished_backport(self):
+        rc = self.stage("rc", RC_SYNC, 2)
+        stable = self.stage("stable", RC_SYNC, 1)
+        (self.root / "stable.backport-pending").mkdir()
+
+        result = self.copy(rc, stable)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfinished backport", result.stderr)
+        self.assertEqual(self.packages(stable), ["glibc-2.43-1-x86_64.pkg.tar.zst"])
+        self.assertEqual(self.uploads(), [])
+
+    def test_refuses_databases_it_cannot_compare(self):
+        stable = self.stage("stable", STABLE_SYNC, 2)
+        rc = self.stage("rc", RC_SYNC, 1)
+        (stable / "core/os/x86_64/core.db").write_text("not a database\n")
+
+        result = self.copy(stable, rc)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("can't be compared", result.stderr)
+        self.assertEqual(self.packages(rc), ["glibc-2.43-1-x86_64.pkg.tar.zst"])
         self.assertEqual(self.uploads(), [])
 
     def test_refuses_a_source_without_a_snapshot(self):
