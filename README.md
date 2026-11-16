@@ -20,7 +20,17 @@ bin/omarchy-mirror-sync-rc
 bin/omarchy-mirror-sync-stable-from-rc
 ```
 
-Snapshots only move forward, from upstream to rc to stable, and stable never syncs from upstream itself. A patch release candidate leaves the mirrors alone: since the last release, rc and stable serve the same snapshot. The copy to stable refuses to move it to an older snapshot than it serves.
+Snapshots only move forward, from upstream to rc to stable, and stable never syncs from upstream itself. A patch release candidate leaves the mirrors alone: since the last release, rc and stable serve the same snapshot. The copy to stable refuses to move it to an older snapshot than it serves, and to move any package back to an older version than it serves, which a backport can make the newer one in the same snapshot. `bin/omarchy-mirror-backwards` lists those packages, comparing versions as pacman's `vercmp` does.
+
+A security fix that can't wait for the next release is backported into the frozen snapshot from the edge stage: rc first, then stable from rc as on release day, so the two stay identical. Each package is named with the exact version that was tested, and the whole set goes up in one upload rather than one per package. pacman fetches each repository's database on its own, so during that upload, or after a failed one until it is run again, a machine can see part of the set: plan a set whose packages each work with the rest of the snapshot as it stands.
+
+```sh
+bin/omarchy-mirror-backport --from /mnt/arch-mirror/ --to /mnt/arch-mirror-rc/ --r2 omarchy:omarchy-mirror-rc \
+  --package core/brotli=1.2.1-1 --package extra/firefox=160.0-1
+bin/omarchy-mirror-sync-stable-from-rc
+```
+
+It swaps each package's entries in the databases for upstream's own, so pacman checks the same checksum and packager signature as on Arch, and leaves the rest of the snapshot and its `lastsync` alone. It writes nothing unless the source serves every package at the version named, which the hourly sync may already have moved on from. A package the snapshot already serves at that version needs nothing from the source, so running it again after a failed upload finishes the upload. It only replaces a package the snapshot already has, only from a newer snapshot, and never with an older version. Each backport is listed in `/backports` on the mirror until the next snapshot from upstream replaces it.
 
 Promote the mirror before the packages. `stable-mirror.omarchy.org/lastsync` matches `rc-mirror.omarchy.org/lastsync` once the copy is up, and only then should stable packages be promoted. Stable packages built against the new snapshot would otherwise reach machines that still get the old one.
 

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""List the packages a stage change would move back to an older version.
+
+    omarchy-mirror-backwards FROM TO
+
+FROM is what TO is about to serve: a stage to copy over TO, or the databases a
+backport is about to install. Each package TO serves in a newer version than
+FROM would is printed as "REPO NAME TO-VERSION -> FROM-VERSION". A package FROM
+drops, or one it adds, is not a move back.
+
+Only the repositories Omarchy machines use count: core, extra and multilib,
+which is what its pacman.conf enables, in that order. A package is matched by
+name across them, so one that moves from extra to core is still compared.
+Testing, staging and unstable repositories, which no machine reads, are left
+out, so they never hold up a release.
+
+Exit status: 0 when nothing moves back, 1 when something does, 2 when a
+database can't be read, since then nobody can tell.
+
+Versions compare as pacman's vercmp does (libalpm's alpm_pkg_vercmp), so that
+an epoch, a pre-release such as 1.0rc1 and a pkgrel all order as on Arch.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import sys
+import tarfile
+
+
+def alnum(c: str) -> bool:
+    """C's isalnum in the C locale: ASCII letters and digits only."""
+    return c.isascii() and c.isalnum()
+
+
+def rpmvercmp(a: str, b: str) -> int:
+    """libalpm's rpmvercmp: compare two version strings segment by segment."""
+    if a == b:
+        return 0
+    i = j = 0
+    while i < len(a) and j < len(b):
+        si, sj = i, j
+        while i < len(a) and not alnum(a[i]):
+            i += 1
+        while j < len(b) and not alnum(b[j]):
+            j += 1
+        if i == len(a) or j == len(b):
+            break
+        # Separators of different length decide it.
+        if i - si != j - sj:
+            return -1 if i - si < j - sj else 1
+        numeric = a[i].isdigit()
+        kind = str.isdigit if numeric else str.isalpha
+        ei, ej = i, j
+        while ei < len(a) and alnum(a[ei]) and kind(a[ei]):
+            ei += 1
+        while ej < len(b) and alnum(b[ej]) and kind(b[ej]):
+            ej += 1
+        one, two = a[i:ei], b[j:ej]
+        # b has a segment of the other type here: a number beats letters.
+        if not two:
+            return 1 if numeric else -1
+        if numeric:
+            one, two = one.lstrip("0"), two.lstrip("0")
+            if len(one) != len(two):
+                return 1 if len(one) > len(two) else -1
+        if one != two:
+            return 1 if one > two else -1
+        i, j = ei, ej
+    rest_a, rest_b = a[i:], b[j:]
+    if not rest_a and not rest_b:
+        return 0
+    # A remaining letter segment never beats an empty string.
+    letter_a = bool(rest_a) and alnum(rest_a[0]) and rest_a[0].isalpha()
+    letter_b = bool(rest_b) and alnum(rest_b[0]) and rest_b[0].isalpha()
+    if (not rest_a and not letter_b) or letter_a:
+        return -1
+    return 1
+
+
+def split(version: str) -> tuple[str, str, str | None]:
+    """[epoch:]pkgver[-pkgrel], as libalpm's parseEVR reads it."""
+    digits = len(version) - len(version.lstrip("0123456789"))
+    if version[digits:digits + 1] == ":":
+        epoch, rest = version[:digits] or "0", version[digits + 1:]
+    else:
+        epoch, rest = "0", version
+    pkgver, sep, pkgrel = rest.rpartition("-")
+    if not sep:
+        return epoch, rest, None
+    return epoch, pkgver, pkgrel
+
+
+def vercmp(a: str, b: str) -> int:
+    """pacman's vercmp: -1, 0 or 1."""
+    if a == b:
+        return 0
+    ea, va, ra = split(a)
+    eb, vb, rb = split(b)
+    result = rpmvercmp(ea, eb) or rpmvercmp(va, vb)
+    if result == 0 and ra is not None and rb is not None:
+        result = rpmvercmp(ra, rb)
+    return result
+
+
+def versions(database: Path) -> dict[str, str]:
+    """NAME -> VERSION for every package a pacman database lists."""
+    found = {}
+    with tarfile.open(database) as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or not member.name.endswith("/desc"):
+                continue
+            fields, key = {}, None
+            for line in tar.extractfile(member).read().decode().splitlines():
+                if line.startswith("%") and line.endswith("%"):
+                    key = line.strip("%")
+                elif line and key and key not in fields:
+                    fields[key] = line
+            if "NAME" not in fields or "VERSION" not in fields:
+                raise ValueError(f"{member.name} has no %NAME% or %VERSION%")
+            found[fields["NAME"]] = fields["VERSION"]
+    return found
+
+
+# The repositories Omarchy's pacman.conf enables, in its order.
+REPOS = ("core", "extra", "multilib")
+
+
+def served(stage: Path) -> dict[str, dict[str, tuple[str, str]]]:
+    """ARCH -> NAME -> (REPO, VERSION) for what a stage serves machines; the
+    first repository that lists a name wins, as in pacman."""
+    found: dict[str, dict[str, tuple[str, str]]] = {}
+    for repo in REPOS:
+        for database in sorted(stage.glob(f"{repo}/os/*/{repo}.db")):
+            packages = found.setdefault(database.parent.name, {})
+            for name, version in versions(database).items():
+                packages.setdefault(name, (repo, version))
+    return found
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("Usage: omarchy-mirror-backwards FROM TO", file=sys.stderr)
+        return 2
+    source, target = Path(sys.argv[1]), Path(sys.argv[2])
+    back = []
+    try:
+        coming = served(source)
+        for arch, packages in sorted(served(target).items()):
+            for name, (repo, version) in sorted(packages.items()):
+                new = coming.get(arch, {}).get(name)
+                if new and vercmp(new[1], version) < 0:
+                    moved = "" if new[0] == repo else f" (in {new[0]})"
+                    back.append(f"{repo} {name} {version} -> {new[1]}{moved}")
+    except (OSError, tarfile.TarError, UnicodeDecodeError, ValueError) as error:
+        print(f"can't read the package databases: {error}", file=sys.stderr)
+        return 2
+    for line in back:
+        print(line)
+    return 1 if back else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
