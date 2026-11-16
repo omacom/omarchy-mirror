@@ -12,7 +12,8 @@ echo "You must insert credentials manually in ~/.config/rclone/rclone.conf"
 
 # Stable changes only on release day (omarchy-mirror-sync-stable-from-rc), so
 # remove the monthly timers that used to re-stage and upload it from upstream.
-for unit in omarchy-mirror-stage-stable omarchy-mirror-upload-stable; do
+# Omarchy builds the T2 Mac packages itself, so the T2 sync is gone too.
+for unit in omarchy-mirror-stage-stable omarchy-mirror-upload-stable omarchy-mirror-t2-sync; do
   systemctl disable --now "$unit.timer" 2>/dev/null || true
   rm -f "/etc/systemd/system/$unit.timer" "/etc/systemd/system/$unit.service"
 done
@@ -21,4 +22,3 @@ done
 cp /root/omarchy-mirror/config/*mirror* /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now omarchy-mirror-sync.timer
-systemctl enable --now omarchy-mirror-t2-sync.timer
