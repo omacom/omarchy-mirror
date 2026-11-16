@@ -24,6 +24,20 @@ Snapshots only move forward, from upstream to rc to stable, and stable never syn
 
 Promote the mirror before the packages. `stable-mirror.omarchy.org/lastsync` matches `rc-mirror.omarchy.org/lastsync` once the copy is up, and only then should stable packages be promoted. Stable packages built against the new snapshot would otherwise reach machines that still get the old one.
 
+## Verifying uploads
+
+R2 can accept an upload, report the right size and ETag, and still stop sending the object partway through its custom domain, on every read, until it is uploaded again. The same object reads back whole through the S3 API. pacman then fails with "Less than 1 bytes/sec", and Cloudflare logs the download as an ordinary `200` cache hit. So `omarchy-mirror-upload` does not publish a database until every package it names has been downloaded through the mirror's public URL.
+
+`bin/omarchy-mirror-verify` reads every staged `.db` and downloads each package it names from the URL in `config/public-urls`, sixteen at a time, with a query string so the check never goes through or into the copy Cloudflare caches for pacman. A read that sends nothing for 30 seconds, a missing package, or a SHA-256 that differs from the database's fails. Packages that pass are listed beside the stage, one list per public host (`/mnt/arch-mirror.verified.mirror.omarchy.org`), and are not read again, so an hourly run reads only what is new. With `--repair` it uploads failures again from the stage, if the stage's copy matches the database, and reads them once more. Anything that still fails stops the upload before the databases, so the mirror keeps serving the last snapshot whose packages all read back, and `omarchy-mirror-sync` fails. More than 200 failures are not re-uploaded (`--max-repair`): that points at the network rather than a few broken objects. A bucket without a public URL, such as arch-mact2's, is not checked.
+
+The first run on each stage has an empty list and reads every package: 16,713 packages and 130.6 GiB for edge on October 28, 2026. To check a whole mirror again, for example after an R2 incident:
+
+```sh
+bin/omarchy-mirror-verify --stage /mnt/arch-mirror/ --r2 omarchy:omarchy-mirror --url https://mirror.omarchy.org --all --repair
+```
+
+A repaired package can still be in Cloudflare's cache as the broken copy: purge its URL after a repair.
+
 ## Arch Linux ARM: local HTTP staging
 
 Arch Linux ARM [pushes to its official mirrors](https://archlinuxarm.org/about/mirrors), but their public HTTP repositories can be pulled independently. `bin/omarchy-mirror-stage-arm` stages packages locally using Python 3.9+ and its standard library. It defaults to the [Florida mirror](https://fl.us.mirror.archlinuxarm.org/) over HTTPS. It does not upload to R2, change existing mirror services, or register an official ARM mirror.

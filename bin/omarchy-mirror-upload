@@ -4,9 +4,12 @@
 # delete packages the databases still on R2 point at.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # Default values
 VERBOSE_RSYNC=""
 VERBOSE_RCLONE=""
+URL=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -18,6 +21,10 @@ while [[ $# -gt 0 ]]; do
     R2="$2"
     shift 2
     ;;
+  --url)
+    URL="$2"
+    shift 2
+    ;;
   --verbose)
     VERBOSE_RSYNC="-v"
     VERBOSE_RCLONE="-vv"
@@ -25,7 +32,7 @@ while [[ $# -gt 0 ]]; do
     ;;
   *)
     echo "Unknown option: $1"
-    echo "Usage: $0 [--stage STAGE] [--r2 R2] [--verbose]"
+    echo "Usage: $0 [--stage STAGE] [--r2 R2] [--url URL] [--verbose]"
     exit 1
     ;;
   esac
@@ -47,6 +54,24 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE \
   --transfers=8 --checkers=32 \
   --include '**/*.sig'
 
+# 1c) Read back every package the new databases name, through the URL pacman
+# uses, before publishing them. R2 has served objects there that stop partway
+# through, and step 1 never replaces an object that exists, so a broken one is
+# re-uploaded here or stops the run.
+if [[ -z $URL ]]; then
+  URL=$(awk -v r2="$R2" '$1 == r2 { print $2 }' "$SCRIPT_DIR/../config/public-urls")
+fi
+if [[ -n $URL ]]; then
+  echo "Verify packages at $URL against the staged databases"
+  "$SCRIPT_DIR/omarchy-mirror-verify" --stage "$STAGE" --r2 "$R2" --url "$URL" --repair
+  # What was just read back whole must not be replaced by the prune.
+  KEEP_VERIFIED="--ignore-existing"
+else
+  echo "$R2 has no public URL in config/public-urls: packages are not read back"
+  # The prune's size check is then the only repair for a short package.
+  KEEP_VERIFIED=""
+fi
+
 # 2) Publish db/files + freshness markers
 echo "Upload db/files + lastsync/lastupdate from stage to R2"
 rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
@@ -56,7 +81,7 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
 # 3) Prune anything no longer present upstream (safe after DB update)
 echo "Prune removed packages on R2"
 rclone sync "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
-  --size-only --no-update-modtime \
+  $KEEP_VERIFIED --size-only --no-update-modtime \
   --checkers=128 --transfers=16 \
   --exclude '**/*.db*' --exclude '**/*.files*' --exclude '/lastsync' --exclude '/lastupdate'
 

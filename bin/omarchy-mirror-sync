@@ -32,6 +32,11 @@ done
 echo "Start syncing Omarchy mirror"
 
 "$SCRIPT_DIR/omarchy-mirror-stage" --upstream "$UPSTREAM" --stage "$STAGE" ${VERBOSE:+--verbose}
-"$SCRIPT_DIR/omarchy-mirror-upload" --stage "$STAGE" --r2 "$R2" ${VERBOSE:+--verbose}
-
-echo "Finished syncing Omarchy mirror in ${SECONDS}s"
+# A failed upload, such as a package that does not read back, keeps the
+# previous databases on R2; the service must fail so it is seen.
+if "$SCRIPT_DIR/omarchy-mirror-upload" --stage "$STAGE" --r2 "$R2" ${VERBOSE:+--verbose}; then
+  echo "Finished syncing Omarchy mirror in ${SECONDS}s"
+else
+  echo "Upload failed: R2 keeps the previous databases" >&2
+  exit 1
+fi
