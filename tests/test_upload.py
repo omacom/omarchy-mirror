@@ -60,6 +60,16 @@ class UploadTest(unittest.TestCase):
         self.assertNotIn("lastsync", lines[databases[0]])
         self.assertNotIn("lastupdate", lines[databases[0]])
         self.assertNotIn(".db", lines[stamps[0]])
+        # Both stamps go up in that call, and the copies before it leave
+        # them out: by excluding them, or by including only other files.
+        self.assertIn("--include /lastupdate", lines[stamps[0]])
+        for line in lines[:databases[0]]:
+            if "--include" in line:
+                self.assertNotIn("lastsync", line)
+                self.assertNotIn("lastupdate", line)
+            else:
+                self.assertIn("--exclude /lastsync", line)
+                self.assertIn("--exclude /lastupdate", line)
 
     def test_a_failed_database_upload_stops_before_the_stamps(self):
         result = self.upload(failing_step="--include **/*.db*")
