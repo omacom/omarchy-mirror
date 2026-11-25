@@ -1,3 +1,4 @@
+import fcntl
 from pathlib import Path
 import shutil
 import socket
@@ -89,10 +90,11 @@ class SyncTest(unittest.TestCase):
             step.write_text(f'#!/bin/bash\necho {name} >> "{self.log}"\nexit {code}\n')
             step.chmod(0o755)
         return subprocess.run(
-            [str(self.bin / "omarchy-mirror-sync"), "--upstream", "u", "--stage", "s", "--r2", "r"],
+            [str(self.bin / "omarchy-mirror-sync"), "--upstream", "u", "--stage", "s/", "--r2", "r"],
             capture_output=True,
             text=True,
             env={"PATH": "/usr/bin:/bin"},
+            cwd=self.root,
         )
 
     def steps(self):
@@ -109,6 +111,17 @@ class SyncTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.steps(), ["omarchy-mirror-stage"])
+
+    def test_a_stage_in_use_is_left_alone(self):
+        # Another sync or copy holds the stage's lock: this run touches
+        # nothing, so it can neither stamp nor upload that run's tree.
+        with open(self.root / "s.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.sync(0, 0)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("in use", result.stderr)
+        self.assertEqual(self.steps(), [])
 
     def test_a_failed_upload_fails_the_sync(self):
         result = self.sync(0, 1)

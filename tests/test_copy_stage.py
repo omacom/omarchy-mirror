@@ -1,3 +1,4 @@
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -66,6 +67,18 @@ class CopyStageTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.uploads(), [f"--stage {stable}/ --r2 omarchy:target"])
+
+    def test_refuses_a_stage_another_sync_or_copy_holds(self):
+        rc = self.stage("rc", RC_SYNC, 1)
+        stable = self.stage("stable", RC_SYNC, 1)
+        for held in (rc, stable):
+            with self.subTest(held=held.name), open(f"{held}.lock", "w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = self.copy(rc, stable)
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("in use", result.stderr)
+                self.assertEqual(self.uploads(), [])
 
     def test_never_moves_a_mirror_back_to_an_older_snapshot(self):
         rc = self.stage("rc", RC_SYNC, 1)

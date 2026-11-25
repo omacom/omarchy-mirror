@@ -33,6 +33,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# One run at a time on a stage, from its stage through its upload. Another
+# sync, or omarchy-mirror-copy-stage, which takes the same lock, would change
+# the tree between this run's rsync and its stamp or upload.
+exec 9>"${STAGE%/}.lock"
+if ! flock -n 9; then
+  echo "${STAGE%/} is in use by another sync or copy" >&2
+  exit 1
+fi
+
 echo "Start syncing Omarchy mirror"
 
 "$SCRIPT_DIR/omarchy-mirror-stage" --upstream "$UPSTREAM" --stage "$STAGE" ${VERBOSE:+--verbose}
