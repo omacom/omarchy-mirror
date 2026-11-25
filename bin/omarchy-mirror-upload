@@ -47,11 +47,17 @@ rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE \
   --transfers=8 --checkers=32 \
   --include '**/*.sig'
 
-# 2) Publish db/files + freshness markers
-echo "Upload db/files + lastsync/lastupdate from stage to R2"
+# 2) Publish db/files, now that every package they name is there
+echo "Upload db/files from stage to R2"
 rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
   --transfers=4 \
-  --include '**/*.db*' --include '**/*.files*' --include '/lastsync' --include '/lastupdate'
+  --include '**/*.db*' --include '**/*.files*'
+
+# 2b) The freshness stamps go up on their own, last. A stamp says which
+# snapshot is served, so it must never arrive before the databases.
+echo "Upload lastsync/lastupdate from stage to R2"
+rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE --fast-list --s3-no-head \
+  --include '/lastsync' --include '/lastupdate'
 
 # 3) Prune anything no longer present upstream (safe after DB update)
 echo "Prune removed packages on R2"
