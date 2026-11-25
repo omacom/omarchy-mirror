@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Stop at the first failed step. A stage that rsync did not finish must not
+# be stamped: lastsync says the stage holds a complete snapshot.
+set -euo pipefail
+
 # Default values
 VERBOSE_RSYNC=""
 VERBOSE_RCLONE=""
@@ -28,7 +32,26 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "Stage the entire mirror locally"
-rsync -rlptH $VERBOSE_RSYNC --safe-links --delete-delay --delay-updates --copy-links rsync://$UPSTREAM $STAGE
+# The stage holds no complete snapshot while rsync runs, nor after it fails:
+# its lastsync goes first, and only a finished rsync writes it again. The
+# upstream's own lastsync stays out, so a failed run never leaves one, and
+# omarchy-mirror-copy-stage refuses a stage without it.
+rm -f "${STAGE%/}/lastsync"
+# An interrupted run leaves rsync's .~tmp~ scratch directories. rsync
+# protects them from --delete-delay while their parent directory stays
+# (rsync 3.2.7, compat.c), so their files would be uploaded. Arch's
+# syncrepo-template removes them before rsync the same way.
+if [[ -d $STAGE ]]; then
+  find "$STAGE" -mindepth 1 -name '.~tmp~' -prune -exec rm -rf {} +
+fi
+# The upstream writes .<name>.<random> temp files while it syncs, readable
+# only by itself. rsync failed on them with "Permission denied" (code 23) in
+# 23 of 720 hourly runs from 26 Oct to 25 Nov 2026. No file of an Arch mirror
+# starts with a dot (none of 66,122 upstream entries on 25 Nov 2026), so they
+# are hidden. A hide works on the sender's side only, so --delete-delay still
+# removes a dot file left in the stage, such as an interrupted run's .~tmp~.
+rsync -rlptH $VERBOSE_RSYNC --safe-links --delete-delay --delay-updates --copy-links \
+  --filter='hide .*' --exclude='/lastsync' "rsync://$UPSTREAM" "$STAGE"
 
 # Mark freshness
 echo "Mark freshness as $(date +%s)"

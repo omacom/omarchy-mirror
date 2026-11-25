@@ -31,6 +31,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# A stage without a lastsync is one rsync did not finish: omarchy-mirror-stage
+# removes it until rsync does. Publishing it would upload a partial tree and
+# prune R2 against it.
+if [[ ! -s ${STAGE%/}/lastsync ]]; then
+  echo "${STAGE%/} has no lastsync, so it holds no complete snapshot and is not uploaded" >&2
+  exit 1
+fi
+
 # 1) Add/refresh packages only (no deletes)
 echo "Upload packages from stage to R2 (additive)"
 rclone copy "$STAGE" "$R2" $VERBOSE_RCLONE \
