@@ -1,7 +1,9 @@
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -57,6 +59,7 @@ class StageTest(unittest.TestCase):
                 result = self.stage_with_rsync(code)
 
                 self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(self.log.exists(), "rsync ran")
                 self.assertFalse((self.stage / "lastsync").exists())
 
     def test_the_upstreams_temp_files_are_hidden(self):
@@ -113,6 +116,67 @@ class SyncTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.steps(), ["omarchy-mirror-stage", "omarchy-mirror-upload"])
         self.assertNotIn("Finished syncing", result.stdout)
+
+
+@unittest.skipUnless(shutil.which("rsync"), "needs rsync")
+class StageWithRsyncTest(unittest.TestCase):
+    """The stage against a real rsync daemon serving a small upstream."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.up, self.stage = self.root / "up", self.root / "stage"
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            self.port = s.getsockname()[1]
+        conf = self.root / "rsyncd.conf"
+        conf.write_text(
+            f"use chroot = no\nlog file = {self.root}/rsyncd.log\npid file = {self.root}/rsyncd.pid\n"
+            f"[archlinux]\npath = {self.up}\nread only = yes\n"
+        )
+        self.up.mkdir()
+        daemon = subprocess.Popen(
+            ["rsync", "--daemon", "--no-detach", f"--config={conf}", f"--port={self.port}", "--address=127.0.0.1"]
+        )
+        self.addCleanup(daemon.wait)
+        self.addCleanup(daemon.terminate)
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+
+    def write(self, base, rel, text="x"):
+        path = base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_stages_the_mirror_without_dot_files_or_the_upstreams_stamp(self):
+        repo = "core/os/x86_64"
+        self.write(self.up, f"{repo}/core.db", "new database")
+        self.write(self.up, f"{repo}/glibc-2.43-1-x86_64.pkg.tar.zst")
+        self.write(self.up, f"{repo}/.core.db.tar.gz.Ab12Cd")  # the upstream mid-sync
+        self.write(self.up, "lastsync", "1999999999\n")
+        # An interrupted run left rsync scratch files: one under a directory
+        # the upstream still serves, one under a directory it dropped.
+        self.write(self.stage, f"{repo}/.~tmp~/glibc-2.42-9-x86_64.pkg.tar.zst")
+        self.write(self.stage, "obsolete/.~tmp~/old-1-1-x86_64.pkg.tar.zst")
+        self.write(self.stage, "lastsync", "1700000000\n")
+
+        result = subprocess.run(
+            [str(BIN / "omarchy-mirror-stage"), "--upstream", f"127.0.0.1:{self.port}/archlinux/",
+             "--stage", f"{self.stage}/"],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        staged = sorted(str(p.relative_to(self.stage)) for p in self.stage.rglob("*"))
+        self.assertEqual(staged, ["core", "core/os", f"{repo}", f"{repo}/core.db",
+                                  f"{repo}/glibc-2.43-1-x86_64.pkg.tar.zst", "lastsync"])
+        stamp = (self.stage / "lastsync").read_text().strip()
+        self.assertNotIn(stamp, ("1999999999", "1700000000"))
 
 
 if __name__ == "__main__":

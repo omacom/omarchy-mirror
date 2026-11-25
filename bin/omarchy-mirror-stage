@@ -37,6 +37,13 @@ echo "Stage the entire mirror locally"
 # upstream's own lastsync stays out, so a failed run never leaves one, and
 # omarchy-mirror-copy-stage refuses a stage without it.
 rm -f "${STAGE%/}/lastsync"
+# An interrupted run leaves rsync's .~tmp~ scratch directories. rsync
+# protects them from --delete-delay while their parent directory stays
+# (rsync 3.2.7, compat.c), so their files would be uploaded. Arch's
+# syncrepo-template removes them before rsync the same way.
+if [[ -d $STAGE ]]; then
+  find "$STAGE" -name '.~tmp~' -prune -exec rm -rf {} +
+fi
 # The upstream writes .<name>.<random> temp files while it syncs, readable
 # only by itself. rsync failed on them with "Permission denied" (code 23) in
 # 23 of 720 hourly runs from 26 Oct to 25 Nov 2026. No file of an Arch mirror
