@@ -49,17 +49,47 @@ class UploadTest(unittest.TestCase):
     def calls(self):
         return [line.split()[0] for line in self.log.read_text().splitlines()]
 
+    def lines(self):
+        return self.log.read_text().splitlines()
+
     def test_runs_every_step(self):
         result = self.upload(failing_step="never")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
+        self.assertEqual(self.calls(), ["copy", "copy", "copy", "copy", "sync"])
 
-    def test_a_failed_database_upload_stops_before_the_prune(self):
+    def test_the_stamps_go_up_alone_after_the_databases(self):
+        # A client or a downstream mirror reads lastsync to learn which
+        # snapshot is served, so it must never arrive before the databases.
+        result = self.upload(failing_step="never")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = self.lines()
+        databases = [i for i, line in enumerate(lines) if "--include **/*.db*" in line]
+        stamps = [i for i, line in enumerate(lines) if "--include /lastsync" in line]
+        self.assertEqual(len(databases), 1)
+        self.assertEqual(len(stamps), 1)
+        self.assertLess(databases[0], stamps[0])
+        self.assertNotIn("lastsync", lines[databases[0]])
+        self.assertNotIn("lastupdate", lines[databases[0]])
+        self.assertNotIn(".db", lines[stamps[0]])
+        # Both stamps go up in that call, and the copies before it leave
+        # them out: by excluding them, or by including only other files.
+        self.assertIn("--include /lastupdate", lines[stamps[0]])
+        for line in lines[:databases[0]]:
+            if "--include" in line:
+                self.assertNotIn("lastsync", line)
+                self.assertNotIn("lastupdate", line)
+            else:
+                self.assertIn("--exclude /lastsync", line)
+                self.assertIn("--exclude /lastupdate", line)
+
+    def test_a_failed_database_upload_stops_before_the_stamps(self):
         result = self.upload(failing_step="--include **/*.db*")
 
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), ["copy", "copy", "copy"])
+        self.assertFalse(any("--include /lastsync" in line for line in self.lines()))
 
 
 if __name__ == "__main__":
