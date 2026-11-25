@@ -14,6 +14,8 @@ class UploadTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.log = self.root / "rclone.log"
         (self.root / "bin").mkdir()
+        (self.root / "stage").mkdir()
+        (self.root / "stage/lastsync").write_text("1792185002\n")
 
     def upload(self, failing_step):
         # rclone stand-in: record each call, and fail the one that publishes
@@ -41,6 +43,17 @@ class UploadTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.calls(), ["copy", "copy", "copy", "sync"])
+
+    def test_refuses_a_stage_without_a_snapshot(self):
+        # A stage rsync did not finish has no lastsync: publishing it would
+        # upload a partial tree and prune R2 against it.
+        (self.root / "stage/lastsync").unlink()
+
+        result = self.upload(failing_step="never")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lastsync", result.stderr)
+        self.assertFalse(self.log.exists())
 
     def test_a_failed_database_upload_stops_before_the_prune(self):
         result = self.upload(failing_step="--include **/*.db*")
