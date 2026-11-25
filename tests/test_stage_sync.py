@@ -56,12 +56,24 @@ class StageTest(unittest.TestCase):
         # last complete run goes too, since the stage no longer holds it.
         for code in (23, 24, 30):
             with self.subTest(code=code):
+                self.log.unlink(missing_ok=True)
                 (self.stage / "lastsync").write_text("1700000000\n")
                 result = self.stage_with_rsync(code)
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertTrue(self.log.exists(), "rsync ran")
                 self.assertFalse((self.stage / "lastsync").exists())
+
+    def test_a_stage_named_like_a_scratch_directory_stays(self):
+        # Only scratch directories inside the stage go, never the stage.
+        self.stage = self.root / ".~tmp~"
+        self.stage.mkdir()
+        (self.stage / "core.db").write_text("kept")
+
+        result = self.stage_with_rsync(0)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.stage / "core.db").read_text(), "kept")
 
     def test_the_upstreams_temp_files_are_hidden(self):
         # The upstream writes .<name>.<random> while it syncs, readable only
@@ -121,6 +133,28 @@ class SyncTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("in use", result.stderr)
+        self.assertEqual(self.steps(), [])
+
+    def test_a_missing_flock_is_not_taken_for_a_stage_in_use(self):
+        # Only the tools the sync needs, without flock.
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "dirname").symlink_to(shutil.which("dirname"))
+        for name in ("omarchy-mirror-stage", "omarchy-mirror-upload"):
+            step = self.bin / name
+            step.write_text(f'#!/bin/bash\necho {name} >> "{self.log}"\n')
+            step.chmod(0o755)
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.bin / "omarchy-mirror-sync"), "--upstream", "u", "--stage", "s/", "--r2", "r"],
+            capture_output=True,
+            text=True,
+            env={"PATH": str(tools)},
+            cwd=self.root,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("needs flock", result.stderr)
         self.assertEqual(self.steps(), [])
 
     def test_a_failed_upload_fails_the_sync(self):

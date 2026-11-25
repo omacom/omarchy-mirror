@@ -80,6 +80,27 @@ class CopyStageTest(unittest.TestCase):
                 self.assertIn("in use", result.stderr)
                 self.assertEqual(self.uploads(), [])
 
+    def test_a_missing_flock_is_not_taken_for_a_stage_in_use(self):
+        rc = self.stage("rc", RC_SYNC, 1)
+        stable = self.stage("stable", RC_SYNC, 1)
+        tools = self.root / "tools"
+        tools.mkdir()
+        for name in ("dirname", "cat", "ls", "rsync"):
+            if shutil.which(name):
+                (tools / name).symlink_to(shutil.which(name))
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.root / "bin/omarchy-mirror-copy-stage"), "--from", f"{rc}/", "--to", f"{stable}/",
+             "--r2", "omarchy:target"],
+            capture_output=True,
+            text=True,
+            env={"PATH": str(tools)},
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("needs flock", result.stderr)
+        self.assertEqual(self.uploads(), [])
+
     def test_never_moves_a_mirror_back_to_an_older_snapshot(self):
         rc = self.stage("rc", RC_SYNC, 1)
         stable = self.stage("stable", STABLE_SYNC, 2)

@@ -42,7 +42,7 @@ rm -f "${STAGE%/}/lastsync"
 # (rsync 3.2.7, compat.c), so their files would be uploaded. Arch's
 # syncrepo-template removes them before rsync the same way.
 if [[ -d $STAGE ]]; then
-  find "$STAGE" -name '.~tmp~' -prune -exec rm -rf {} +
+  find "$STAGE" -mindepth 1 -name '.~tmp~' -prune -exec rm -rf {} +
 fi
 # The upstream writes .<name>.<random> temp files while it syncs, readable
 # only by itself. rsync failed on them with "Permission denied" (code 23) in

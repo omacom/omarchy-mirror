@@ -36,6 +36,7 @@ done
 # One run at a time on a stage, from its stage through its upload. Another
 # sync, or omarchy-mirror-copy-stage, which takes the same lock, would change
 # the tree between this run's rsync and its stamp or upload.
+command -v flock >/dev/null || { echo "$0 needs flock (util-linux)" >&2; exit 1; }
 exec 9>"${STAGE%/}.lock"
 if ! flock -n 9; then
   echo "${STAGE%/} is in use by another sync or copy" >&2

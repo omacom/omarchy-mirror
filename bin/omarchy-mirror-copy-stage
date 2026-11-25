@@ -40,6 +40,7 @@ fi
 # Both stages stay locked until the upload is done, the same lock
 # omarchy-mirror-sync takes: a sync of the source while it is copied would
 # change the tree after its lastsync was read.
+command -v flock >/dev/null || { echo "$0 needs flock (util-linux)" >&2; exit 1; }
 exec 8>"${FROM%/}.lock" 9>"${TO%/}.lock"
 if ! flock -n 8 || ! flock -n 9; then
   echo "${FROM%/} or ${TO%/} is in use by another sync or copy" >&2
