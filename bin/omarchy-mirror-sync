@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Stop at the first failed step: a failed stage uploads nothing, and a failed
+# stage or upload fails the service, so it is seen.
+set -euo pipefail
+
 # Enable execution of subscripts
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 

@@ -10,6 +10,8 @@ The rc mirror, `https://rc-mirror.omarchy.org/`, holds the snapshot taken when a
 
 The edge mirror tracks the very latest Arch repositories every hour. It's located at `https://mirror.omarchy.org/`. Omarchy users can switch to this using _Update > Channel > Edge_ in the Omarchy Menu.
 
+`bin/omarchy-mirror-sync` is that hourly job: `omarchy-mirror-stage` rsyncs the upstream into the local stage and stamps it with `lastsync`, then `omarchy-mirror-upload` publishes it. A run that rsync does not finish writes no `lastsync` and uploads nothing, and the service fails. The next hour's run tries again. The upstream's own temp files (`.<name>.<random>`) are left out, since no file of an Arch mirror starts with a dot.
+
 On the mirror host:
 
 ```sh

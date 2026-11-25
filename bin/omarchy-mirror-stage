@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Stop at the first failed step. A stage that rsync did not finish must not
+# be stamped: lastsync says the stage holds a complete snapshot.
+set -euo pipefail
+
 # Default values
 VERBOSE_RSYNC=""
 VERBOSE_RCLONE=""
@@ -28,7 +32,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "Stage the entire mirror locally"
-rsync -rlptH $VERBOSE_RSYNC --safe-links --delete-delay --delay-updates --copy-links rsync://$UPSTREAM $STAGE
+# The upstream writes .<name>.<random> temp files while it syncs, readable
+# only by itself. rsync failed on them with "Permission denied" (code 23) in
+# 23 of 720 hourly runs from 26 Oct to 25 Nov 2026. No file of an Arch mirror
+# starts with a dot, so they are left out.
+rsync -rlptH $VERBOSE_RSYNC --safe-links --delete-delay --delay-updates --copy-links \
+  --exclude='.*' "rsync://$UPSTREAM" "$STAGE"
 
 # Mark freshness
 echo "Mark freshness as $(date +%s)"
